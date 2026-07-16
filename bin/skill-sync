@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
-# skill-sync — fail-closed updater for third-party skills declared in external-skills.tsv.
+# skill-sync — fail-closed updater for skill sources. Two target kinds:
+#   * external skills declared in external-skills.tsv (addressed by name)
+#   * any git repo, incl. this one (~/skills), addressed by directory path
 #
 # Trust model: skills are executable instructions. An update applies only when a reviewer
-# report (containing a machine-checkable `verdict: approved`) + approval artifact — bound to
-# the exact pinned SHA, candidate SHA, and SHA-256 of BOTH the pinned..candidate diff and the
-# object-inventory — exists AND still matches at apply time. The heuristic text gate and the
-# object inspector can only BLOCK; they never approve. A BLOCKED bundle additionally requires
-# the report to carry `override-blocked: <candidate8>`. `apply` re-derives every hash.
+# report containing `verdict: approved` + an approval artifact — bound to the exact
+# baseline SHA, candidate SHA, and SHA-256 of BOTH the diff and the object-inventory — exists
+# AND still matches at apply time. Heuristic text gate + object inspector only BLOCK; a
+# BLOCKED bundle additionally requires `override-blocked: <candidate8>` in the report.
+# apply re-derives every hash and enforces clean tree / origin / ancestor invariants.
 #
-# Flow:
-#   skill-sync check [name]                 fetch (no checkout) -> bundle (.diff/.objects) + gates
-#   <reviewer subagent reads .diff + .objects (decoding any IMAGE), writes a report, then:>
-#   skill-sync approve <name> <reviewer-id> <report-file>
-#   skill-sync apply <name>                 verify report+approval+invariants -> ff-only -> re-pin
+# Flow (external):   skill-sync check [name]  -> approve <name> <rev> <report>  -> apply <name>
+# Flow (repo/own):   skill-sync inspect <dir> -> approve-repo <dir> <rev> <report> -> apply-repo <dir>
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MANIFEST="${SKILL_SYNC_MANIFEST:-$REPO_ROOT/external-skills.tsv}"
 CACHE="$HOME/.cache/skill-sync"; mkdir -p "$CACHE"
 bold=$'\e[1m'; dim=$'\e[2m'; grn=$'\e[32m'; ylw=$'\e[33m'; red=$'\e[31m'; rst=$'\e[0m'
+ZERO=0000000000000000000000000000000000000000
 
 expand(){ printf '%s' "${1/#\~/$HOME}"; }
 sha256(){ sha256sum "$1" | awk '{print $1}'; }
+str_sha(){ printf '%s' "$1" | sha256sum | awk '{print $1}'; }
 base_for(){ printf '%s/%s-%s..%s' "$CACHE" "$1" "${2:0:8}" "${3:0:8}"; }
 read_manifest(){ grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$MANIFEST"; }
 manifest_line(){ read_manifest | awk -F'\t' -v n="$1" '$1==n'; }
+fetch_candidate(){ git -C "$1" fetch -q origin "$2" 2>/dev/null || return 1; git -C "$1" rev-parse "origin/$2"; }
 
-scan_added(){ # stdin=diff -> hits; return 1 if any (heuristic text gate; supplementary only)
+scan_added(){ # stdin=diff -> hits; return 1 if any (supplementary text gate)
   local hits
   hits=$(grep -aE '^\+' | grep -avE '^\+\+\+' | grep -naEi \
     -e 'curl[^|]*\|[[:space:]]*(sh|bash)|wget[^|]*\|[[:space:]]*(sh|bash)' \
@@ -40,17 +42,14 @@ scan_added(){ # stdin=diff -> hits; return 1 if any (heuristic text gate; supple
   return 0
 }
 
-# Object inventory via git plumbing -> plain-text $4 (outfile). Sets OBJ_BLOCK=1 on danger.
-# Catches what textual diff hides: symlinks (120000), submodules (160000), newly-exec files,
-# and non-image binaries. Images are surfaced for the reviewer to decode, not auto-blocked.
-inspect_objects(){ # dir pinned cand outfile
-  local dir="$1" pinned="$2" cand="$3" out="$4" bin_paths mark="$CACHE/.objblock.$$"
+inspect_objects(){ # dir baseline cand outfile -> sets OBJ_BLOCK
+  local dir="$1" a="$2" c="$3" out="$4" bin_paths mark="$CACHE/.objblock.$$"
   OBJ_BLOCK=0; : > "$out"; rm -f "$mark"
-  bin_paths=$(git -C "$dir" diff --numstat "$pinned" "$cand" | awk -F'\t' '$1=="-"&&$2=="-"{print $3}')
-  git -C "$dir" diff --raw --abbrev=40 "$pinned" "$cand" | while IFS=$'\t' read -r meta path rest; do
+  bin_paths=$(git -C "$dir" diff --numstat "$a" "$c" | awk -F'\t' '$1=="-"&&$2=="-"{print $3}')
+  git -C "$dir" diff --raw --abbrev=40 "$a" "$c" | while IFS=$'\t' read -r meta path rest; do
     set -- $meta                       # :oldmode newmode oldsha newsha status
     local oldmode="${1#:}" newmode="$2" newsha="$4" status="$5" flag="" size="-" osha="-"
-    if [ "$newsha" != "0000000000000000000000000000000000000000" ]; then
+    if [ "$newsha" != "$ZERO" ]; then
       size=$(git -C "$dir" cat-file -s "$newsha" 2>/dev/null || echo '?')
       osha=$(git -C "$dir" cat-file blob "$newsha" 2>/dev/null | sha256sum | awk '{print $1}')
     fi
@@ -71,14 +70,12 @@ inspect_objects(){ # dir pinned cand outfile
   [ -f "$mark" ] && { OBJ_BLOCK=1; rm -f "$mark"; }
 }
 
-fetch_candidate(){ git -C "$1" fetch -q origin "$2" 2>/dev/null || return 1; git -C "$1" rev-parse "origin/$2"; }
-
-build_bundle(){ # name dir pinned cand
-  local name="$1" dir="$2" pinned="$3" cand="$4" base; base=$(base_for "$name" "$pinned" "$cand")
-  git -C "$dir" diff "$pinned" "$cand" > "$base.diff"
-  printf '%sdiffstat:%s\n' "$bold" "$rst"; git -C "$dir" diff --stat "$pinned" "$cand" | sed 's/^/  /' | tail -12
+build_bundle(){ # key dir baseline cand approve_cmd apply_cmd
+  local key="$1" dir="$2" a="$3" c="$4" acmd="$5" pcmd="$6" base; base=$(base_for "$key" "$a" "$c")
+  git -C "$dir" diff "$a" "$c" > "$base.diff"
+  printf '%sdiffstat:%s\n' "$bold" "$rst"; git -C "$dir" diff --stat "$a" "$c" | sed 's/^/  /' | tail -12
   rm -f "$base.BLOCKED"
-  inspect_objects "$dir" "$pinned" "$cand" "$base.objects"; local objblock=$OBJ_BLOCK
+  inspect_objects "$dir" "$a" "$c" "$base.objects"; local objblock=$OBJ_BLOCK
   printf '%schanged objects (status/mode/size/sha256):%s\n' "$bold" "$rst"; sed 's/^/  /' "$base.objects"
   local domains
   domains=$(grep -aE '^\+' "$base.diff" | grep -avE '^\+\+\+' | grep -aoiE 'https?://[a-z0-9.-]+' | sort -u)
@@ -88,47 +85,57 @@ build_bundle(){ # name dir pinned cand
   else printf '%sheuristic text gate: HIGH-RISK%s\n' "$red" "$rst"; printf '%s\n' "$scan" | sed 's/^/  !/'; scanblock=1; fi
   local dsha osha; dsha=$(sha256 "$base.diff"); osha=$(sha256 "$base.objects")
   if [ "$objblock" = 1 ] || [ "$scanblock" = 1 ]; then
-    touch "$base.BLOCKED"; printf '%sGATE: BLOCKED%s — dangerous object/pattern; report must carry `override-blocked: %s`\n' "$red" "$rst" "${cand:0:8}"
-  else printf '%sGATE: no hard flags%s (NOT approval — reviewer must still read diff+objects)\n' "$grn" "$rst"; fi
-  printf '%sbundle:  %s.diff  |  objects: %s.objects%s\n' "$dim" "$base" "$base" "$rst"
-  printf '%sdiff sha256:    %s%s\n' "$dim" "$dsha" "$rst"
-  printf '%sobjects sha256: %s%s\n' "$dim" "$osha" "$rst"
-  printf '%sREVIEW REQUIRED%s: reviewer reads diff+objects, writes report with `verdict: approved`, then:\n' "$bold" "$rst"
-  printf '  skill-sync approve %s <reviewer-id> <report-file>   &&   skill-sync apply %s\n' "$name" "$name"
+    touch "$base.BLOCKED"; printf '%sGATE: BLOCKED%s — report must carry `override-blocked: %s`\n' "$red" "$rst" "${c:0:8}"
+  else printf '%sGATE: no hard flags%s (NOT approval — reviewer must read diff+objects)\n' "$grn" "$rst"; fi
+  printf '%sbundle:  %s.diff | objects: %s.objects%s\n' "$dim" "$base" "$base" "$rst"
+  printf '%sdiff sha256: %s   objects sha256: %s%s\n' "$dim" "$dsha" "$osha" "$rst"
+  printf '%sREVIEW REQUIRED%s: reviewer reads diff+objects (decode IMAGE), writes report with `verdict: approved`, then:\n' "$bold" "$rst"
+  printf '  %s   &&   %s\n' "$acmd" "$pcmd"
 }
 
-cmd_check(){
-  local only="${1:-}"
-  read_manifest | while IFS=$'\t' read -r name url branch pinned target; do
-    [ -n "$only" ] && [ "$name" != "$only" ] && continue
-    local dir; dir=$(expand "$target")
-    printf '\n%s== %s ==%s  %s\n' "$bold" "$name" "$rst" "$dim$url$rst"
-    [ -d "$dir/.git" ] || { printf '%sclone missing at %s%s\n' "$red" "$dir" "$rst"; continue; }
-    local cand; cand=$(fetch_candidate "$dir" "$branch") || { printf '%sfetch failed%s\n' "$red" "$rst"; continue; }
-    printf 'pinned:    %s\ncandidate: %s\n' "$pinned" "$cand"
-    [ "$pinned" = "$cand" ] && { printf '%sup to date%s\n' "$grn" "$rst"; continue; }
-    build_bundle "$name" "$dir" "$pinned" "$cand"
-  done
+# --- target resolution: sets T_KIND T_KEY T_DIR T_BRANCH T_BASE T_URL T_NAME ---
+resolve_external(){
+  local line; line=$(manifest_line "$1"); [ -z "$line" ] && { printf '%sunknown skill: %s%s\n' "$red" "$1" "$rst"; exit 2; }
+  IFS=$'\t' read -r T_NAME T_URL T_BRANCH T_BASE _t <<<"$line"
+  T_KIND=external; T_KEY="$T_NAME"; T_DIR=$(expand "$_t")
+}
+resolve_repo(){
+  local d; d=$(expand "$1"); d=$(cd "$d" 2>/dev/null && pwd -P) || { printf '%sno such dir%s\n' "$red" "$rst"; exit 2; }
+  [ -d "$d/.git" ] || { printf '%snot a git repo: %s%s\n' "$red" "$d" "$rst"; exit 2; }
+  T_KIND=repo; T_DIR="$d"; T_BRANCH=$(git -C "$d" rev-parse --abbrev-ref HEAD)
+  T_BASE=$(git -C "$d" rev-parse HEAD); T_URL=$(git -C "$d" remote get-url origin 2>/dev/null)
+  T_KEY="repo-$(str_sha "$d" | cut -c1-12)"
 }
 
-cmd_approve(){ # name reviewer-id report-file
-  local name="$1" rev="${2:-}" report="${3:-}"
-  { [ -z "$name" ] || [ -z "$rev" ] || [ -z "$report" ]; } && { echo "usage: skill-sync approve <name> <reviewer-id> <report-file>"; exit 2; }
-  [ -s "$report" ] || { printf '%sreport missing/empty: %s%s\n' "$red" "$report" "$rst"; exit 2; }
-  grep -qiE '^[[:space:]]*verdict:[[:space:]]*approved' "$report" || { printf '%sreport lacks machine-checkable `verdict: approved`%s\n' "$red" "$rst"; exit 2; }
-  local line; line=$(manifest_line "$name"); [ -z "$line" ] && { printf '%sunknown skill%s\n' "$red" "$rst"; exit 2; }
-  IFS=$'\t' read -r n url branch pinned target <<<"$line"
-  local dir; dir=$(expand "$target"); local cand; cand=$(fetch_candidate "$dir" "$branch") || { echo "fetch failed"; exit 1; }
-  local base; base=$(base_for "$name" "$pinned" "$cand")
-  { [ -f "$base.diff" ] && [ -f "$base.objects" ]; } || { printf '%sno bundle — run: skill-sync check %s%s\n' "$red" "$name" "$rst"; exit 1; }
+do_check(){ # requires resolved T_*
+  printf '\n%s== %s [%s] ==%s  %s\n' "$bold" "$T_KEY" "$T_KIND" "$rst" "$dim$T_URL$rst"
+  [ -d "$T_DIR/.git" ] || { printf '%sclone missing at %s%s\n' "$red" "$T_DIR" "$rst"; return; }
+  local cand; cand=$(fetch_candidate "$T_DIR" "$T_BRANCH") || { printf '%sfetch failed%s\n' "$red" "$rst"; return; }
+  printf 'baseline:  %s\ncandidate: %s\n' "$T_BASE" "$cand"
+  [ "$T_BASE" = "$cand" ] && { printf '%sup to date%s\n' "$grn" "$rst"; return; }
+  local acmd pcmd
+  if [ "$T_KIND" = external ]; then acmd="skill-sync approve $T_NAME <rev> <report>"; pcmd="skill-sync apply $T_NAME"
+  else acmd="skill-sync approve-repo $T_DIR <rev> <report>"; pcmd="skill-sync apply-repo $T_DIR"; fi
+  build_bundle "$T_KEY" "$T_DIR" "$T_BASE" "$cand" "$acmd" "$pcmd"
+}
+
+do_approve(){ # $1 reviewer  $2 report ; requires resolved T_*
+  local rev="$1" report="$2"
+  { [ -z "$rev" ] || [ -z "$report" ]; } && { echo "need <reviewer-id> <report-file>"; exit 2; }
+  [ -s "$report" ] || { printf '%sreport missing/empty%s\n' "$red" "$rst"; exit 2; }
+  grep -qiE '^[[:space:]]*verdict:[[:space:]]*approved' "$report" || { printf '%sreport lacks `verdict: approved`%s\n' "$red" "$rst"; exit 2; }
+  local cand; cand=$(fetch_candidate "$T_DIR" "$T_BRANCH") || { echo "fetch failed"; exit 1; }
+  local base; base=$(base_for "$T_KEY" "$T_BASE" "$cand")
+  { [ -f "$base.diff" ] && [ -f "$base.objects" ]; } || { printf '%sno bundle — run check/inspect first%s\n' "$red" "$rst"; exit 1; }
   if [ -f "$base.BLOCKED" ]; then
-    grep -qiE "^[[:space:]]*override-blocked:[[:space:]]*${cand:0:8}" "$report" || { printf '%sbundle BLOCKED — report must carry `override-blocked: %s`%s\n' "$red" "${cand:0:8}" "$rst"; exit 2; }
+    grep -qiE "^[[:space:]]*override-blocked:[[:space:]]*${cand:0:8}" "$report" || { printf '%sBLOCKED — report needs `override-blocked: %s`%s\n' "$red" "${cand:0:8}" "$rst"; exit 2; }
   fi
   local dsha osha rsha; dsha=$(sha256 "$base.diff"); osha=$(sha256 "$base.objects"); rsha=$(sha256 "$report")
   cp "$report" "$base.report"
   cat > "$base.approved" <<EOF
-skill=$name
-pinned=$pinned
+kind=$T_KIND
+target=$T_DIR
+baseline=$T_BASE
 candidate=$cand
 diff_sha256=$dsha
 objects_sha256=$osha
@@ -137,49 +144,48 @@ reviewer=$rev
 verdict=approved
 approved_at=$(date -u +%FT%TZ)
 EOF
-  printf '%sapproval recorded%s %s..%s by %s (diff %s, objects %s)\n' "$grn" "$rst" "${pinned:0:8}" "${cand:0:8}" "$rev" "${dsha:0:12}" "${osha:0:12}"
+  printf '%sapproval recorded%s %s..%s by %s\n' "$grn" "$rst" "${T_BASE:0:8}" "${cand:0:8}" "$rev"
 }
 
-cmd_apply(){
-  local name="$1"; [ -z "$name" ] && { echo "usage: skill-sync apply <name>"; exit 2; }
-  local line; line=$(manifest_line "$name"); [ -z "$line" ] && { printf '%sunknown skill%s\n' "$red" "$rst"; exit 2; }
-  IFS=$'\t' read -r n url branch pinned target <<<"$line"
-  local dir; dir=$(expand "$target")
-  [ -d "$dir/.git" ] || { printf '%sclone missing%s\n' "$red" "$rst"; exit 1; }
-  local origin; origin=$(git -C "$dir" remote get-url origin 2>/dev/null)
-  [ "$origin" = "$url" ] || { printf '%sorigin mismatch%s\n' "$red" "$rst"; exit 1; }
-  local head; head=$(git -C "$dir" rev-parse HEAD)
-  [ "$head" = "$pinned" ] || { printf '%sHEAD != pinned (local drift)%s\n' "$red" "$rst"; exit 1; }
-  [ -z "$(git -C "$dir" status --porcelain)" ] || { printf '%sworking tree not clean — refusing%s\n' "$red" "$rst"; exit 1; }
-  local cand; cand=$(fetch_candidate "$dir" "$branch") || { echo "fetch failed"; exit 1; }
-  [ "$pinned" = "$cand" ] && { printf '%salready at candidate%s\n' "$grn" "$rst"; exit 0; }
-  git -C "$dir" merge-base --is-ancestor "$pinned" "$cand" || { printf '%spinned not ancestor of candidate (diverged) — manual%s\n' "$red" "$rst"; exit 1; }
-  local base; base=$(base_for "$name" "$pinned" "$cand")
-  { [ -f "$base.approved" ] && [ -f "$base.report" ] && [ -f "$base.objects" ]; } || { printf '%sno approval/report/objects — run check then approve%s\n' "$red" "$rst"; exit 1; }
-  local live live_sha objs_now ap_sha ap_osha ap_pinned ap_cand ap_rsha rnow
-  live=$(mktemp); git -C "$dir" diff "$pinned" "$cand" > "$live"; live_sha=$(sha256 "$live"); rm -f "$live"
-  objs_now=$(mktemp); inspect_objects "$dir" "$pinned" "$cand" "$objs_now"; local objs_now_sha; objs_now_sha=$(sha256 "$objs_now"); rm -f "$objs_now"
-  ap_sha=$(awk -F= '/^diff_sha256=/{print $2}' "$base.approved")
-  ap_osha=$(awk -F= '/^objects_sha256=/{print $2}' "$base.approved")
-  ap_pinned=$(awk -F= '/^pinned=/{print $2}' "$base.approved")
-  ap_cand=$(awk -F= '/^candidate=/{print $2}' "$base.approved")
-  ap_rsha=$(awk -F= '/^report_sha256=/{print $2}' "$base.approved")
-  rnow=$(sha256 "$base.report")
-  { [ "$ap_pinned" = "$pinned" ] && [ "$ap_cand" = "$cand" ]; } || { printf '%sapproval SHAs mismatch%s\n' "$red" "$rst"; exit 1; }
-  [ "$ap_sha"  = "$live_sha" ]     || { printf '%sdiff changed since approval — re-review%s\n' "$red" "$rst"; exit 1; }
-  [ "$ap_osha" = "$objs_now_sha" ] || { printf '%sobject inventory changed since approval — re-review%s\n' "$red" "$rst"; exit 1; }
-  [ "$ap_rsha" = "$rnow" ]         || { printf '%sreport changed since approval — re-approve%s\n' "$red" "$rst"; exit 1; }
-  printf 'apply %s: %s -> %s (ff-only, reviewer %s)\n' "$name" "${pinned:0:8}" "${cand:0:8}" "$(awk -F= '/^reviewer=/{print $2}' "$base.approved")"
-  read -r -p "confirm apply? [y/N] " a </dev/tty; [[ "$a" =~ ^[Yy]$ ]] || { echo "aborted."; exit 1; }
-  git -C "$dir" merge --ff-only "$cand" || { printf '%sff-only failed%s\n' "$red" "$rst"; exit 1; }
-  local tmp; tmp=$(mktemp); awk -F'\t' -v OFS='\t' -v n="$name" -v c="$cand" '$1==n{$4=c}1' "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
-  printf '%sapplied + re-pinned %s -> %s%s\n' "$grn" "$name" "${cand:0:8}" "$rst"
-  echo "commit the manifest change in ~/skills to record the new pin."
+do_apply(){ # requires resolved T_*
+  [ -d "$T_DIR/.git" ] || { printf '%sclone missing%s\n' "$red" "$rst"; exit 1; }
+  if [ "$T_KIND" = external ]; then
+    local origin; origin=$(git -C "$T_DIR" remote get-url origin 2>/dev/null)
+    [ "$origin" = "$T_URL" ] || { printf '%sorigin mismatch%s\n' "$red" "$rst"; exit 1; }
+  fi
+  local head; head=$(git -C "$T_DIR" rev-parse HEAD)
+  [ "$head" = "$T_BASE" ] || { printf '%sHEAD != baseline (local drift)%s\n' "$red" "$rst"; exit 1; }
+  [ -z "$(git -C "$T_DIR" status --porcelain)" ] || { printf '%sworking tree not clean — refusing%s\n' "$red" "$rst"; exit 1; }
+  local cand; cand=$(fetch_candidate "$T_DIR" "$T_BRANCH") || { echo "fetch failed"; exit 1; }
+  [ "$T_BASE" = "$cand" ] && { printf '%salready at candidate%s\n' "$grn" "$rst"; exit 0; }
+  git -C "$T_DIR" merge-base --is-ancestor "$T_BASE" "$cand" || { printf '%sbaseline not ancestor (diverged) — manual%s\n' "$red" "$rst"; exit 1; }
+  local base; base=$(base_for "$T_KEY" "$T_BASE" "$cand")
+  { [ -f "$base.approved" ] && [ -f "$base.report" ] && [ -f "$base.objects" ]; } || { printf '%sno approval/report/objects — approve after review%s\n' "$red" "$rst"; exit 1; }
+  local live live_sha objs objs_sha
+  live=$(mktemp); git -C "$T_DIR" diff "$T_BASE" "$cand" > "$live"; live_sha=$(sha256 "$live"); rm -f "$live"
+  objs=$(mktemp); inspect_objects "$T_DIR" "$T_BASE" "$cand" "$objs"; objs_sha=$(sha256 "$objs"); rm -f "$objs"
+  local a; a(){ awk -F= -v k="$1" '$1==k{print $2}' "$base.approved"; }
+  { [ "$(a baseline)" = "$T_BASE" ] && [ "$(a candidate)" = "$cand" ]; } || { printf '%sapproval SHA mismatch%s\n' "$red" "$rst"; exit 1; }
+  [ "$(a diff_sha256)"    = "$live_sha" ] || { printf '%sdiff changed since approval%s\n' "$red" "$rst"; exit 1; }
+  [ "$(a objects_sha256)" = "$objs_sha" ] || { printf '%sobjects changed since approval%s\n' "$red" "$rst"; exit 1; }
+  [ "$(a report_sha256)"  = "$(sha256 "$base.report")" ] || { printf '%sreport changed since approval%s\n' "$red" "$rst"; exit 1; }
+  printf 'apply %s: %s -> %s (ff-only, reviewer %s)\n' "$T_KEY" "${T_BASE:0:8}" "${cand:0:8}" "$(a reviewer)"
+  local ans=""; read -r -p "confirm apply? [y/N] " ans </dev/tty || true; [[ "$ans" =~ ^[Yy]$ ]] || { echo "aborted."; exit 1; }
+  git -C "$T_DIR" merge --ff-only "$cand" || { printf '%sff-only failed%s\n' "$red" "$rst"; exit 1; }
+  if [ "$T_KIND" = external ]; then
+    local tmp; tmp=$(mktemp); awk -F'\t' -v OFS='\t' -v n="$T_NAME" -v c="$cand" '$1==n{$4=c}1' "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
+    echo "commit the manifest change in ~/skills to record the new pin."
+  fi
+  printf '%sapplied %s -> %s%s\n' "$grn" "$T_KEY" "${cand:0:8}" "$rst"
 }
 
 case "${1:-check}" in
-  check)   cmd_check "${2:-}" ;;
-  approve) cmd_approve "${2:-}" "${3:-}" "${4:-}" ;;
-  apply)   cmd_apply "${2:-}" ;;
-  *)       cmd_check "$1" ;;
+  check)        if [ -n "${2:-}" ]; then resolve_external "$2"; do_check
+                else read_manifest | while IFS=$'\t' read -r n _; do resolve_external "$n"; do_check; done; fi ;;
+  approve)      resolve_external "${2:?name}"; do_approve "${3:-}" "${4:-}" ;;
+  apply)        resolve_external "${2:?name}"; do_apply ;;
+  inspect)      resolve_repo "${2:?dir}"; do_check ;;
+  approve-repo) resolve_repo "${2:?dir}"; do_approve "${3:-}" "${4:-}" ;;
+  apply-repo)   resolve_repo "${2:?dir}"; do_apply ;;
+  *)            read_manifest | while IFS=$'\t' read -r n _; do resolve_external "$n"; do_check; done ;;
 esac

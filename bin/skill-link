@@ -40,3 +40,29 @@ echo "linking omp-scoped skills into $OMP_DIR"
 for name in $OMP_ALSO; do
   [ -d "$SRC/$name" ] && link_one "$name" "$OMP_DIR"
 done
+
+# put bin scripts on PATH (single source of truth = repo copy)
+BIN_DEST="$HOME/.local/bin"
+echo "linking bin scripts into $BIN_DEST"
+mkdir -p "$BIN_DEST"
+for b in skill-sync skill-link uptool; do
+  src="$REPO_ROOT/bin/$b"; dest="$BIN_DEST/$b"
+  [ -f "$src" ] || continue
+  if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$src" ]; then echo "  ${dim}ok   $dest${rst}"; continue; fi
+  if [ "$CHECK" = 1 ]; then echo "  ${ylw}would link $dest -> $src${rst}"; continue; fi
+  [ -e "$dest" ] && [ ! -L "$dest" ] && { mv "$dest" "$dest.pre-link.$(date +%s)"; echo "  ${ylw}backed up $dest${rst}"; }
+  rm -f "$dest"; ln -s "$src" "$dest"; echo "  ${grn}link $dest -> $src${rst}"
+done
+
+# clone external skills at their pinned commit (content not vendored; only pins tracked)
+MANIFEST="$REPO_ROOT/external-skills.tsv"
+if [ -f "$MANIFEST" ]; then
+  echo "external skills (pinned clones)"
+  grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$MANIFEST" | while IFS=$'\t' read -r name url branch pinned target; do
+    dir="${target/#\~/$HOME}"
+    if [ -d "$dir/.git" ]; then echo "  ${dim}ok   $name ($dir)${rst}"; continue; fi
+    if [ "$CHECK" = 1 ]; then echo "  ${ylw}would clone $url -> $dir @ ${pinned:0:8}${rst}"; continue; fi
+    git clone -q "$url" "$dir" && git -C "$dir" checkout -q "$branch" && git -C "$dir" reset --hard -q "$pinned" \
+      && echo "  ${grn}cloned $name @ ${pinned:0:8}${rst}" || echo "  ${ylw}clone failed: $name${rst}"
+  done
+fi
