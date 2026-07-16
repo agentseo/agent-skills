@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# skill-sync — fail-closed updater for third-party skills declared in external-skills.tsv.
+#
+# Flow (per skill that is behind its pinned commit):
+#   1. fetch  (no checkout, working tree untouched)
+#   2. build an immutable review bundle: pinned..candidate diff, new domains, new/changed
+#      executables, and a heuristic HIGH-RISK gate
+#   3. STOP. An independent reviewer must read the bundle. This script never blesses a diff;
+#      heuristics can only BLOCK, never approve.
+#   4. only `skill-sync apply <name>` — after review — fast-forwards to the reviewed SHA and
+#      re-pins the manifest. Never automatic, never bypassed by any -y flag.
+#
+# Usage:
+#   skill-sync                 # check all, emit review bundles for anything behind
+#   skill-sync check [name]    # same, optionally one skill
+#   skill-sync apply <name>    # apply the reviewed candidate (interactive confirm required)
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+MANIFEST="$REPO_ROOT/external-skills.tsv"
+CACHE="$HOME/.cache/skill-sync"; mkdir -p "$CACHE"
+bold=$'\e[1m'; dim=$'\e[2m'; grn=$'\e[32m'; ylw=$'\e[33m'; red=$'\e[31m'; rst=$'\e[0m'
+expand(){ printf '%s' "${1/#\~/$HOME}"; }
+
+# Heuristic HIGH-RISK gate over added (+) lines. Supplementary only: a clean scan is NOT
+# an approval; a hit is a hard block until a human reviewer clears it.
+scan_added(){ # stdin = diff; prints category:line hits; returns 1 if any hit
+  local hits
+  hits=$(grep -E '^\+' | grep -vE '^\+\+\+' | grep -nEi \
+    -e 'curl[^|]*\|[[:space:]]*(sh|bash)|wget[^|]*\|[[:space:]]*(sh|bash)' \
+    -e 'base64[[:space:]]+(-d|--decode)|eval[[:space:]]*[("$]|iex|Invoke-Expression' \
+    -e 'rm[[:space:]]+-rf|mkfs|dd[[:space:]]+if=|:\(\)\{' \
+    -e '\.ssh|id_rsa|\.aws/credentials|\.env\b|GITHUB_TOKEN|gh[[:space:]]+auth[[:space:]]+token|printenv|(^|[^a-z])env[[:space:]]*\|' \
+    -e 'nc[[:space:]]+-|/dev/tcp/|curl[[:space:]]+.*(-d|-F|--data|-T)[[:space:]]' \
+    -e 'crontab|systemctl|launchctl|chmod[[:space:]]+\+x' \
+    -e 'ignore[[:space:]]+(all[[:space:]]+)?previous|disregard[[:space:]]+(the[[:space:]]+)?instructions|do[[:space:]]+not[[:space:]]+tell[[:space:]]+the[[:space:]]+user|exfiltrat' )
+  [ -n "$hits" ] && { printf '%s\n' "$hits"; return 1; }
+  return 0
+}
+
+build_bundle(){ # $1 name  $2 dir  $3 pinned  $4 candidate
+  local name="$1" dir="$2" pinned="$3" cand="$4"
+  local base="$CACHE/${name}-${pinned:0:8}..${cand:0:8}"
+  git -C "$dir" diff "$pinned" "$cand" > "$base.diff"
+  printf '%sdiffstat:%s\n' "$bold" "$rst"
+  git -C "$dir" diff --stat "$pinned" "$cand" | sed 's/^/  /' | tail -20
+  # new domains introduced in added lines
+  local domains
+  domains=$(grep -E '^\+' "$base.diff" | grep -vE '^\+\+\+' \
+    | grep -oiE 'https?://[a-z0-9.-]+' | sort -u)
+  [ -n "$domains" ] && { printf '%snew/added URLs:%s\n' "$bold" "$rst"; printf '%s\n' "$domains" | sed 's/^/  /'; }
+  # new or mode-changed executable-ish files
+  local execs
+  execs=$(git -C "$dir" diff --name-status "$pinned" "$cand" \
+    | grep -iE '\.(sh|bash|py|js|ts|rb|pl|ps1)$|mode change')
+  [ -n "$execs" ] && { printf '%snew/changed executables:%s\n' "$ylw" "$rst"; printf '%s\n' "$execs" | sed 's/^/  /'; }
+  # heuristic gate
+  local scan
+  if scan=$(grep -E '^\+' "$base.diff" | scan_added); then
+    printf '%sheuristic gate: no hard flags%s (NOT an approval — review the diff)\n' "$grn" "$rst"
+  else
+    printf '%sheuristic gate: HIGH-RISK patterns — BLOCKED until reviewed%s\n' "$red" "$rst"
+    printf '%s\n' "$scan" | sed 's/^/  !/'
+    touch "$base.BLOCKED"
+  fi
+  printf '%sbundle: %s.diff%s\n' "$dim" "$base" "$rst"
+  printf '%sREVIEW REQUIRED%s — have an independent reviewer read the diff, then: skill-sync apply %s\n' "$bold" "$rst" "$name"
+}
+
+read_manifest(){ grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$MANIFEST"; }
+
+cmd_check(){
+  local only="${1:-}"
+  read_manifest | while IFS=$'\t' read -r name url branch pinned target; do
+    [ -n "$only" ] && [ "$name" != "$only" ] && continue
+    local dir; dir=$(expand "$target")
+    printf '\n%s== %s ==%s  %s\n' "$bold" "$name" "$rst" "$dim$url$rst"
+    if [ ! -d "$dir/.git" ]; then printf '%sclone missing at %s%s\n' "$red" "$dir" "$rst"; continue; fi
+    git -C "$dir" fetch -q origin "$branch" 2>/dev/null || { printf '%sfetch failed%s\n' "$red" "$rst"; continue; }
+    local cand; cand=$(git -C "$dir" rev-parse "origin/$branch")
+    printf 'pinned:    %s\ncandidate: %s\n' "$pinned" "$cand"
+    if [ "$pinned" = "$cand" ]; then printf '%sup to date%s\n' "$grn" "$rst"; continue; fi
+    build_bundle "$name" "$dir" "$pinned" "$cand"
+  done
+}
+
+cmd_apply(){
+  local name="$1"; [ -z "$name" ] && { echo "usage: skill-sync apply <name>"; exit 2; }
+  local line; line=$(read_manifest | awk -F'\t' -v n="$name" '$1==n')
+  [ -z "$line" ] && { printf '%sunknown skill: %s%s\n' "$red" "$name" "$rst"; exit 2; }
+  IFS=$'\t' read -r n url branch pinned target <<<"$line"
+  local dir; dir=$(expand "$target")
+  git -C "$dir" fetch -q origin "$branch" || { echo "fetch failed"; exit 1; }
+  local cand; cand=$(git -C "$dir" rev-parse "origin/$branch")
+  [ "$pinned" = "$cand" ] && { printf '%salready at candidate%s\n' "$grn" "$rst"; exit 0; }
+  local base="$CACHE/${name}-${pinned:0:8}..${cand:0:8}"
+  [ -f "$base.diff" ] || { printf '%sno review bundle for %s..%s — run `skill-sync check %s` first%s\n' "$red" "${pinned:0:8}" "${cand:0:8}" "$name" "$rst"; exit 1; }
+  if [ -f "$base.BLOCKED" ]; then
+    printf '%sbundle flagged HIGH-RISK by heuristic gate.%s Clear only after an independent reviewer approved it.\n' "$red" "$rst"
+    read -r -p "reviewer approved this diff? type EXACTLY 'reviewed-ok': " ack </dev/tty
+    [ "$ack" = "reviewed-ok" ] || { echo "aborted."; exit 1; }
+  fi
+  printf 'apply %s: %s -> %s (fast-forward only)\n' "$name" "${pinned:0:8}" "${cand:0:8}"
+  read -r -p "confirm apply? [y/N] " a </dev/tty; [[ "$a" =~ ^[Yy]$ ]] || { echo "aborted."; exit 1; }
+  # clean tree + fast-forward only; refuse local divergence
+  git -C "$dir" diff --quiet || { printf '%sworking tree not clean — refusing%s\n' "$red" "$rst"; exit 1; }
+  git -C "$dir" merge --ff-only "$cand" || { printf '%snot fast-forwardable (diverged) — resolve manually%s\n' "$red" "$rst"; exit 1; }
+  # re-pin manifest
+  local tmp; tmp=$(mktemp)
+  awk -F'\t' -v OFS='\t' -v n="$name" -v c="$cand" '$1==n{$4=c}1' "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
+  printf '%sapplied and re-pinned %s -> %s%s\n' "$grn" "$name" "${cand:0:8}" "$rst"
+  echo "commit the manifest change in ~/skills to record the new pin."
+}
+
+case "${1:-check}" in
+  check) shift $(( $# ? 1 : 0 )); cmd_check "${1:-}" ;;
+  apply) cmd_apply "${2:-}" ;;
+  *)     cmd_check "$1" ;;
+esac

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# skill-link — symlink every skill in this repo into the agent skill dirs.
+# Idempotent. Run after cloning ~/skills on a new machine.
+#   skill-link            # link into ~/.claude/skills (+ ~/.omp/agent/skills for omp-* / orchestrating-work)
+#   skill-link --check    # report only, make no changes
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="$REPO_ROOT/skills"
+CLAUDE_DIR="$HOME/.claude/skills"
+OMP_DIR="$HOME/.omp/agent/skills"
+# skills that also belong in the OMP agent dir
+OMP_ALSO="omp-ruki-agenty orchestrating-work"
+
+CHECK=0; [ "${1:-}" = "--check" ] && CHECK=1
+grn=$'\e[32m'; ylw=$'\e[33m'; dim=$'\e[2m'; rst=$'\e[0m'
+
+link_one(){ # $1 = skill name, $2 = dest dir
+  local name="$1" dir="$2" dest target
+  dest="$dir/$name"; target="$SRC/$name"
+  mkdir -p "$dir"
+  if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$target" ]; then
+    echo "  ${dim}ok   $dest${rst}"; return
+  fi
+  if [ "$CHECK" = 1 ]; then echo "  ${ylw}would link $dest -> $target${rst}"; return; fi
+  if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+    mv "$dest" "$dest.pre-link.$(date +%s)"   # never clobber real data
+    echo "  ${ylw}backed up existing $dest${rst}"
+  fi
+  rm -f "$dest"; ln -s "$target" "$dest"
+  echo "  ${grn}link $dest -> $target${rst}"
+}
+
+echo "linking repo skills into $CLAUDE_DIR"
+for p in "$SRC"/*/; do
+  [ -d "$p" ] || continue
+  link_one "$(basename "$p")" "$CLAUDE_DIR"
+done
+echo "linking omp-scoped skills into $OMP_DIR"
+for name in $OMP_ALSO; do
+  [ -d "$SRC/$name" ] && link_one "$name" "$OMP_DIR"
+done

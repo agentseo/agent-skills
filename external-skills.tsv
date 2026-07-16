@@ -1,0 +1,6 @@
+# External (third-party) skills — NOT authored here. Only their pinned commit is tracked.
+# Updates go through bin/skill-sync: fetch (no checkout) -> review bundle -> independent
+# review -> explicit confirm -> fast-forward to the reviewed SHA -> re-pin here.
+# Columns (TAB-separated): name  repo_url  branch  pinned_sha  target_dir
+humanizer-ru	https://github.com/Vladimir-Human/humanizer-ru.git	main	63511310466030367cfda910d8320d0b2ff6f2aa	~/.claude/skills/humanizer-ru
+threads-carousel	https://github.com/itchernetski/threads-carousel-claude-skill.git	main	cc775b668088ba348022bc2296ff41f130f1f7ef	~/.claude/skills/threads-carousel
