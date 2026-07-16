@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
 # skill-sync — fail-closed updater for third-party skills declared in external-skills.tsv.
 #
-# Flow (per skill that is behind its pinned commit):
-#   1. fetch  (no checkout, working tree untouched)
-#   2. build an immutable review bundle: pinned..candidate diff, new domains, new/changed
-#      executables, and a heuristic HIGH-RISK gate
-#   3. STOP. An independent reviewer must read the bundle. This script never blesses a diff;
-#      heuristics can only BLOCK, never approve.
-#   4. only `skill-sync apply <name>` — after review — fast-forwards to the reviewed SHA and
-#      re-pins the manifest. Never automatic, never bypassed by any -y flag.
+# Trust model: skills are executable instructions. An update applies only when a reviewer
+# report (containing a machine-checkable `verdict: approved`) + approval artifact — bound to
+# the exact pinned SHA, candidate SHA, and SHA-256 of BOTH the pinned..candidate diff and the
+# object-inventory — exists AND still matches at apply time. The heuristic text gate and the
+# object inspector can only BLOCK; they never approve. A BLOCKED bundle additionally requires
+# the report to carry `override-blocked: <candidate8>`. `apply` re-derives every hash.
 #
-# Usage:
-#   skill-sync                 # check all, emit review bundles for anything behind
-#   skill-sync check [name]    # same, optionally one skill
-#   skill-sync apply <name>    # apply the reviewed candidate (interactive confirm required)
+# Flow:
+#   skill-sync check [name]                 fetch (no checkout) -> bundle (.diff/.objects) + gates
+#   <reviewer subagent reads .diff + .objects (decoding any IMAGE), writes a report, then:>
+#   skill-sync approve <name> <reviewer-id> <report-file>
+#   skill-sync apply <name>                 verify report+approval+invariants -> ff-only -> re-pin
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-MANIFEST="$REPO_ROOT/external-skills.tsv"
+MANIFEST="${SKILL_SYNC_MANIFEST:-$REPO_ROOT/external-skills.tsv}"
 CACHE="$HOME/.cache/skill-sync"; mkdir -p "$CACHE"
 bold=$'\e[1m'; dim=$'\e[2m'; grn=$'\e[32m'; ylw=$'\e[33m'; red=$'\e[31m'; rst=$'\e[0m'
-expand(){ printf '%s' "${1/#\~/$HOME}"; }
 
-# Heuristic HIGH-RISK gate over added (+) lines. Supplementary only: a clean scan is NOT
-# an approval; a hit is a hard block until a human reviewer clears it.
-scan_added(){ # stdin = diff; prints category:line hits; returns 1 if any hit
+expand(){ printf '%s' "${1/#\~/$HOME}"; }
+sha256(){ sha256sum "$1" | awk '{print $1}'; }
+base_for(){ printf '%s/%s-%s..%s' "$CACHE" "$1" "${2:0:8}" "${3:0:8}"; }
+read_manifest(){ grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$MANIFEST"; }
+manifest_line(){ read_manifest | awk -F'\t' -v n="$1" '$1==n'; }
+
+scan_added(){ # stdin=diff -> hits; return 1 if any (heuristic text gate; supplementary only)
   local hits
-  hits=$(grep -E '^\+' | grep -vE '^\+\+\+' | grep -nEi \
+  hits=$(grep -aE '^\+' | grep -avE '^\+\+\+' | grep -naEi \
     -e 'curl[^|]*\|[[:space:]]*(sh|bash)|wget[^|]*\|[[:space:]]*(sh|bash)' \
     -e 'base64[[:space:]]+(-d|--decode)|eval[[:space:]]*[("$]|iex|Invoke-Expression' \
     -e 'rm[[:space:]]+-rf|mkfs|dd[[:space:]]+if=|:\(\)\{' \
@@ -38,36 +40,62 @@ scan_added(){ # stdin = diff; prints category:line hits; returns 1 if any hit
   return 0
 }
 
-build_bundle(){ # $1 name  $2 dir  $3 pinned  $4 candidate
-  local name="$1" dir="$2" pinned="$3" cand="$4"
-  local base="$CACHE/${name}-${pinned:0:8}..${cand:0:8}"
-  git -C "$dir" diff "$pinned" "$cand" > "$base.diff"
-  printf '%sdiffstat:%s\n' "$bold" "$rst"
-  git -C "$dir" diff --stat "$pinned" "$cand" | sed 's/^/  /' | tail -20
-  # new domains introduced in added lines
-  local domains
-  domains=$(grep -E '^\+' "$base.diff" | grep -vE '^\+\+\+' \
-    | grep -oiE 'https?://[a-z0-9.-]+' | sort -u)
-  [ -n "$domains" ] && { printf '%snew/added URLs:%s\n' "$bold" "$rst"; printf '%s\n' "$domains" | sed 's/^/  /'; }
-  # new or mode-changed executable-ish files
-  local execs
-  execs=$(git -C "$dir" diff --name-status "$pinned" "$cand" \
-    | grep -iE '\.(sh|bash|py|js|ts|rb|pl|ps1)$|mode change')
-  [ -n "$execs" ] && { printf '%snew/changed executables:%s\n' "$ylw" "$rst"; printf '%s\n' "$execs" | sed 's/^/  /'; }
-  # heuristic gate
-  local scan
-  if scan=$(grep -E '^\+' "$base.diff" | scan_added); then
-    printf '%sheuristic gate: no hard flags%s (NOT an approval — review the diff)\n' "$grn" "$rst"
-  else
-    printf '%sheuristic gate: HIGH-RISK patterns — BLOCKED until reviewed%s\n' "$red" "$rst"
-    printf '%s\n' "$scan" | sed 's/^/  !/'
-    touch "$base.BLOCKED"
-  fi
-  printf '%sbundle: %s.diff%s\n' "$dim" "$base" "$rst"
-  printf '%sREVIEW REQUIRED%s — have an independent reviewer read the diff, then: skill-sync apply %s\n' "$bold" "$rst" "$name"
+# Object inventory via git plumbing -> plain-text $4 (outfile). Sets OBJ_BLOCK=1 on danger.
+# Catches what textual diff hides: symlinks (120000), submodules (160000), newly-exec files,
+# and non-image binaries. Images are surfaced for the reviewer to decode, not auto-blocked.
+inspect_objects(){ # dir pinned cand outfile
+  local dir="$1" pinned="$2" cand="$3" out="$4" bin_paths mark="$CACHE/.objblock.$$"
+  OBJ_BLOCK=0; : > "$out"; rm -f "$mark"
+  bin_paths=$(git -C "$dir" diff --numstat "$pinned" "$cand" | awk -F'\t' '$1=="-"&&$2=="-"{print $3}')
+  git -C "$dir" diff --raw --abbrev=40 "$pinned" "$cand" | while IFS=$'\t' read -r meta path rest; do
+    set -- $meta                       # :oldmode newmode oldsha newsha status
+    local oldmode="${1#:}" newmode="$2" newsha="$4" status="$5" flag="" size="-" osha="-"
+    if [ "$newsha" != "0000000000000000000000000000000000000000" ]; then
+      size=$(git -C "$dir" cat-file -s "$newsha" 2>/dev/null || echo '?')
+      osha=$(git -C "$dir" cat-file blob "$newsha" 2>/dev/null | sha256sum | awk '{print $1}')
+    fi
+    case "$newmode" in
+      120000) flag="SYMLINK-BLOCK";;
+      160000) flag="SUBMODULE-BLOCK";;
+      100755) [ "$oldmode" = "100755" ] || flag="EXEC-BIT-BLOCK";;
+    esac
+    if printf '%s\n' "$bin_paths" | grep -qxF "$path"; then
+      case "${path,,}" in
+        *.png|*.jpg|*.jpeg|*.gif|*.webp|*.svg|*.ico|*.bmp) flag="${flag:+$flag }IMAGE-reviewer-decode";;
+        *) flag="${flag:+$flag }BINARY-BLOCK";;
+      esac
+    fi
+    printf '%s mode=%s->%s %-40s size=%s sha256=%s %s\n' "$status" "$oldmode" "$newmode" "$path" "$size" "$osha" "$flag" >> "$out"
+    case "$flag" in *BLOCK*) echo x >>"$mark";; esac
+  done
+  [ -f "$mark" ] && { OBJ_BLOCK=1; rm -f "$mark"; }
 }
 
-read_manifest(){ grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$MANIFEST"; }
+fetch_candidate(){ git -C "$1" fetch -q origin "$2" 2>/dev/null || return 1; git -C "$1" rev-parse "origin/$2"; }
+
+build_bundle(){ # name dir pinned cand
+  local name="$1" dir="$2" pinned="$3" cand="$4" base; base=$(base_for "$name" "$pinned" "$cand")
+  git -C "$dir" diff "$pinned" "$cand" > "$base.diff"
+  printf '%sdiffstat:%s\n' "$bold" "$rst"; git -C "$dir" diff --stat "$pinned" "$cand" | sed 's/^/  /' | tail -12
+  rm -f "$base.BLOCKED"
+  inspect_objects "$dir" "$pinned" "$cand" "$base.objects"; local objblock=$OBJ_BLOCK
+  printf '%schanged objects (status/mode/size/sha256):%s\n' "$bold" "$rst"; sed 's/^/  /' "$base.objects"
+  local domains
+  domains=$(grep -aE '^\+' "$base.diff" | grep -avE '^\+\+\+' | grep -aoiE 'https?://[a-z0-9.-]+' | sort -u)
+  [ -n "$domains" ] && { printf '%snew/added URLs:%s\n' "$bold" "$rst"; printf '%s\n' "$domains" | sed 's/^/  /'; }
+  local scan scanblock=0
+  if scan=$(scan_added < "$base.diff"); then printf '%sheuristic text gate: no hard flags%s\n' "$grn" "$rst"
+  else printf '%sheuristic text gate: HIGH-RISK%s\n' "$red" "$rst"; printf '%s\n' "$scan" | sed 's/^/  !/'; scanblock=1; fi
+  local dsha osha; dsha=$(sha256 "$base.diff"); osha=$(sha256 "$base.objects")
+  if [ "$objblock" = 1 ] || [ "$scanblock" = 1 ]; then
+    touch "$base.BLOCKED"; printf '%sGATE: BLOCKED%s — dangerous object/pattern; report must carry `override-blocked: %s`\n' "$red" "$rst" "${cand:0:8}"
+  else printf '%sGATE: no hard flags%s (NOT approval — reviewer must still read diff+objects)\n' "$grn" "$rst"; fi
+  printf '%sbundle:  %s.diff  |  objects: %s.objects%s\n' "$dim" "$base" "$base" "$rst"
+  printf '%sdiff sha256:    %s%s\n' "$dim" "$dsha" "$rst"
+  printf '%sobjects sha256: %s%s\n' "$dim" "$osha" "$rst"
+  printf '%sREVIEW REQUIRED%s: reviewer reads diff+objects, writes report with `verdict: approved`, then:\n' "$bold" "$rst"
+  printf '  skill-sync approve %s <reviewer-id> <report-file>   &&   skill-sync apply %s\n' "$name" "$name"
+}
 
 cmd_check(){
   local only="${1:-}"
@@ -75,45 +103,83 @@ cmd_check(){
     [ -n "$only" ] && [ "$name" != "$only" ] && continue
     local dir; dir=$(expand "$target")
     printf '\n%s== %s ==%s  %s\n' "$bold" "$name" "$rst" "$dim$url$rst"
-    if [ ! -d "$dir/.git" ]; then printf '%sclone missing at %s%s\n' "$red" "$dir" "$rst"; continue; fi
-    git -C "$dir" fetch -q origin "$branch" 2>/dev/null || { printf '%sfetch failed%s\n' "$red" "$rst"; continue; }
-    local cand; cand=$(git -C "$dir" rev-parse "origin/$branch")
+    [ -d "$dir/.git" ] || { printf '%sclone missing at %s%s\n' "$red" "$dir" "$rst"; continue; }
+    local cand; cand=$(fetch_candidate "$dir" "$branch") || { printf '%sfetch failed%s\n' "$red" "$rst"; continue; }
     printf 'pinned:    %s\ncandidate: %s\n' "$pinned" "$cand"
-    if [ "$pinned" = "$cand" ]; then printf '%sup to date%s\n' "$grn" "$rst"; continue; fi
+    [ "$pinned" = "$cand" ] && { printf '%sup to date%s\n' "$grn" "$rst"; continue; }
     build_bundle "$name" "$dir" "$pinned" "$cand"
   done
 }
 
+cmd_approve(){ # name reviewer-id report-file
+  local name="$1" rev="${2:-}" report="${3:-}"
+  { [ -z "$name" ] || [ -z "$rev" ] || [ -z "$report" ]; } && { echo "usage: skill-sync approve <name> <reviewer-id> <report-file>"; exit 2; }
+  [ -s "$report" ] || { printf '%sreport missing/empty: %s%s\n' "$red" "$report" "$rst"; exit 2; }
+  grep -qiE '^[[:space:]]*verdict:[[:space:]]*approved' "$report" || { printf '%sreport lacks machine-checkable `verdict: approved`%s\n' "$red" "$rst"; exit 2; }
+  local line; line=$(manifest_line "$name"); [ -z "$line" ] && { printf '%sunknown skill%s\n' "$red" "$rst"; exit 2; }
+  IFS=$'\t' read -r n url branch pinned target <<<"$line"
+  local dir; dir=$(expand "$target"); local cand; cand=$(fetch_candidate "$dir" "$branch") || { echo "fetch failed"; exit 1; }
+  local base; base=$(base_for "$name" "$pinned" "$cand")
+  { [ -f "$base.diff" ] && [ -f "$base.objects" ]; } || { printf '%sno bundle — run: skill-sync check %s%s\n' "$red" "$name" "$rst"; exit 1; }
+  if [ -f "$base.BLOCKED" ]; then
+    grep -qiE "^[[:space:]]*override-blocked:[[:space:]]*${cand:0:8}" "$report" || { printf '%sbundle BLOCKED — report must carry `override-blocked: %s`%s\n' "$red" "${cand:0:8}" "$rst"; exit 2; }
+  fi
+  local dsha osha rsha; dsha=$(sha256 "$base.diff"); osha=$(sha256 "$base.objects"); rsha=$(sha256 "$report")
+  cp "$report" "$base.report"
+  cat > "$base.approved" <<EOF
+skill=$name
+pinned=$pinned
+candidate=$cand
+diff_sha256=$dsha
+objects_sha256=$osha
+report_sha256=$rsha
+reviewer=$rev
+verdict=approved
+approved_at=$(date -u +%FT%TZ)
+EOF
+  printf '%sapproval recorded%s %s..%s by %s (diff %s, objects %s)\n' "$grn" "$rst" "${pinned:0:8}" "${cand:0:8}" "$rev" "${dsha:0:12}" "${osha:0:12}"
+}
+
 cmd_apply(){
   local name="$1"; [ -z "$name" ] && { echo "usage: skill-sync apply <name>"; exit 2; }
-  local line; line=$(read_manifest | awk -F'\t' -v n="$name" '$1==n')
-  [ -z "$line" ] && { printf '%sunknown skill: %s%s\n' "$red" "$name" "$rst"; exit 2; }
+  local line; line=$(manifest_line "$name"); [ -z "$line" ] && { printf '%sunknown skill%s\n' "$red" "$rst"; exit 2; }
   IFS=$'\t' read -r n url branch pinned target <<<"$line"
   local dir; dir=$(expand "$target")
-  git -C "$dir" fetch -q origin "$branch" || { echo "fetch failed"; exit 1; }
-  local cand; cand=$(git -C "$dir" rev-parse "origin/$branch")
+  [ -d "$dir/.git" ] || { printf '%sclone missing%s\n' "$red" "$rst"; exit 1; }
+  local origin; origin=$(git -C "$dir" remote get-url origin 2>/dev/null)
+  [ "$origin" = "$url" ] || { printf '%sorigin mismatch%s\n' "$red" "$rst"; exit 1; }
+  local head; head=$(git -C "$dir" rev-parse HEAD)
+  [ "$head" = "$pinned" ] || { printf '%sHEAD != pinned (local drift)%s\n' "$red" "$rst"; exit 1; }
+  [ -z "$(git -C "$dir" status --porcelain)" ] || { printf '%sworking tree not clean — refusing%s\n' "$red" "$rst"; exit 1; }
+  local cand; cand=$(fetch_candidate "$dir" "$branch") || { echo "fetch failed"; exit 1; }
   [ "$pinned" = "$cand" ] && { printf '%salready at candidate%s\n' "$grn" "$rst"; exit 0; }
-  local base="$CACHE/${name}-${pinned:0:8}..${cand:0:8}"
-  [ -f "$base.diff" ] || { printf '%sno review bundle for %s..%s — run `skill-sync check %s` first%s\n' "$red" "${pinned:0:8}" "${cand:0:8}" "$name" "$rst"; exit 1; }
-  if [ -f "$base.BLOCKED" ]; then
-    printf '%sbundle flagged HIGH-RISK by heuristic gate.%s Clear only after an independent reviewer approved it.\n' "$red" "$rst"
-    read -r -p "reviewer approved this diff? type EXACTLY 'reviewed-ok': " ack </dev/tty
-    [ "$ack" = "reviewed-ok" ] || { echo "aborted."; exit 1; }
-  fi
-  printf 'apply %s: %s -> %s (fast-forward only)\n' "$name" "${pinned:0:8}" "${cand:0:8}"
+  git -C "$dir" merge-base --is-ancestor "$pinned" "$cand" || { printf '%spinned not ancestor of candidate (diverged) — manual%s\n' "$red" "$rst"; exit 1; }
+  local base; base=$(base_for "$name" "$pinned" "$cand")
+  { [ -f "$base.approved" ] && [ -f "$base.report" ] && [ -f "$base.objects" ]; } || { printf '%sno approval/report/objects — run check then approve%s\n' "$red" "$rst"; exit 1; }
+  local live live_sha objs_now ap_sha ap_osha ap_pinned ap_cand ap_rsha rnow
+  live=$(mktemp); git -C "$dir" diff "$pinned" "$cand" > "$live"; live_sha=$(sha256 "$live"); rm -f "$live"
+  objs_now=$(mktemp); inspect_objects "$dir" "$pinned" "$cand" "$objs_now"; local objs_now_sha; objs_now_sha=$(sha256 "$objs_now"); rm -f "$objs_now"
+  ap_sha=$(awk -F= '/^diff_sha256=/{print $2}' "$base.approved")
+  ap_osha=$(awk -F= '/^objects_sha256=/{print $2}' "$base.approved")
+  ap_pinned=$(awk -F= '/^pinned=/{print $2}' "$base.approved")
+  ap_cand=$(awk -F= '/^candidate=/{print $2}' "$base.approved")
+  ap_rsha=$(awk -F= '/^report_sha256=/{print $2}' "$base.approved")
+  rnow=$(sha256 "$base.report")
+  { [ "$ap_pinned" = "$pinned" ] && [ "$ap_cand" = "$cand" ]; } || { printf '%sapproval SHAs mismatch%s\n' "$red" "$rst"; exit 1; }
+  [ "$ap_sha"  = "$live_sha" ]     || { printf '%sdiff changed since approval — re-review%s\n' "$red" "$rst"; exit 1; }
+  [ "$ap_osha" = "$objs_now_sha" ] || { printf '%sobject inventory changed since approval — re-review%s\n' "$red" "$rst"; exit 1; }
+  [ "$ap_rsha" = "$rnow" ]         || { printf '%sreport changed since approval — re-approve%s\n' "$red" "$rst"; exit 1; }
+  printf 'apply %s: %s -> %s (ff-only, reviewer %s)\n' "$name" "${pinned:0:8}" "${cand:0:8}" "$(awk -F= '/^reviewer=/{print $2}' "$base.approved")"
   read -r -p "confirm apply? [y/N] " a </dev/tty; [[ "$a" =~ ^[Yy]$ ]] || { echo "aborted."; exit 1; }
-  # clean tree + fast-forward only; refuse local divergence
-  git -C "$dir" diff --quiet || { printf '%sworking tree not clean — refusing%s\n' "$red" "$rst"; exit 1; }
-  git -C "$dir" merge --ff-only "$cand" || { printf '%snot fast-forwardable (diverged) — resolve manually%s\n' "$red" "$rst"; exit 1; }
-  # re-pin manifest
-  local tmp; tmp=$(mktemp)
-  awk -F'\t' -v OFS='\t' -v n="$name" -v c="$cand" '$1==n{$4=c}1' "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
-  printf '%sapplied and re-pinned %s -> %s%s\n' "$grn" "$name" "${cand:0:8}" "$rst"
+  git -C "$dir" merge --ff-only "$cand" || { printf '%sff-only failed%s\n' "$red" "$rst"; exit 1; }
+  local tmp; tmp=$(mktemp); awk -F'\t' -v OFS='\t' -v n="$name" -v c="$cand" '$1==n{$4=c}1' "$MANIFEST" > "$tmp" && mv "$tmp" "$MANIFEST"
+  printf '%sapplied + re-pinned %s -> %s%s\n' "$grn" "$name" "${cand:0:8}" "$rst"
   echo "commit the manifest change in ~/skills to record the new pin."
 }
 
 case "${1:-check}" in
-  check) shift $(( $# ? 1 : 0 )); cmd_check "${1:-}" ;;
-  apply) cmd_apply "${2:-}" ;;
-  *)     cmd_check "$1" ;;
+  check)   cmd_check "${2:-}" ;;
+  approve) cmd_approve "${2:-}" "${3:-}" "${4:-}" ;;
+  apply)   cmd_apply "${2:-}" ;;
+  *)       cmd_check "$1" ;;
 esac
