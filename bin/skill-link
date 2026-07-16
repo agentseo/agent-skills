@@ -18,11 +18,11 @@ grn=$'\e[32m'; ylw=$'\e[33m'; dim=$'\e[2m'; rst=$'\e[0m'
 link_one(){ # $1 = skill name, $2 = dest dir
   local name="$1" dir="$2" dest target
   dest="$dir/$name"; target="$SRC/$name"
-  mkdir -p "$dir"
   if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$target" ]; then
     echo "  ${dim}ok   $dest${rst}"; return
   fi
   if [ "$CHECK" = 1 ]; then echo "  ${ylw}would link $dest -> $target${rst}"; return; fi
+  mkdir -p "$dir"
   if [ -e "$dest" ] && [ ! -L "$dest" ]; then
     mv "$dest" "$dest.pre-link.$(date +%s)"   # never clobber real data
     echo "  ${ylw}backed up existing $dest${rst}"
@@ -44,25 +44,38 @@ done
 # put bin scripts on PATH (single source of truth = repo copy)
 BIN_DEST="$HOME/.local/bin"
 echo "linking bin scripts into $BIN_DEST"
-mkdir -p "$BIN_DEST"
 for b in skill-sync skill-link uptool; do
   src="$REPO_ROOT/bin/$b"; dest="$BIN_DEST/$b"
   [ -f "$src" ] || continue
   if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$src" ]; then echo "  ${dim}ok   $dest${rst}"; continue; fi
   if [ "$CHECK" = 1 ]; then echo "  ${ylw}would link $dest -> $src${rst}"; continue; fi
+  mkdir -p "$BIN_DEST"
   [ -e "$dest" ] && [ ! -L "$dest" ] && { mv "$dest" "$dest.pre-link.$(date +%s)"; echo "  ${ylw}backed up $dest${rst}"; }
   rm -f "$dest"; ln -s "$src" "$dest"; echo "  ${grn}link $dest -> $src${rst}"
 done
 
-# clone external skills at their pinned commit (content not vendored; only pins tracked)
+# clone external skills at their pinned commit (content not vendored; only pins tracked).
+# fail-closed: verify an existing clone's origin + HEAD==pin; fresh clone lands atomically.
 MANIFEST="$REPO_ROOT/external-skills.tsv"
 if [ -f "$MANIFEST" ]; then
   echo "external skills (pinned clones)"
   grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$MANIFEST" | while IFS=$'\t' read -r name url branch pinned target; do
     dir="${target/#\~/$HOME}"
-    if [ -d "$dir/.git" ]; then echo "  ${dim}ok   $name ($dir)${rst}"; continue; fi
+    if [ -d "$dir/.git" ]; then
+      o=$(git -C "$dir" remote get-url origin 2>/dev/null); h=$(git -C "$dir" rev-parse HEAD 2>/dev/null)
+      if [ "$o" != "$url" ]; then echo "  ${ylw}$name: origin mismatch ($o != $url)${rst}"
+      elif [ "$h" != "$pinned" ]; then echo "  ${ylw}$name: HEAD ${h:0:8} != pinned ${pinned:0:8} (use skill-sync)${rst}"
+      else echo "  ${dim}ok   $name (@ ${pinned:0:8})${rst}"; fi
+      continue
+    fi
     if [ "$CHECK" = 1 ]; then echo "  ${ylw}would clone $url -> $dir @ ${pinned:0:8}${rst}"; continue; fi
-    git clone -q "$url" "$dir" && git -C "$dir" checkout -q "$branch" && git -C "$dir" reset --hard -q "$pinned" \
-      && echo "  ${grn}cloned $name @ ${pinned:0:8}${rst}" || echo "  ${ylw}clone failed: $name${rst}"
+    tmp=$(mktemp -d)
+    if git clone -q "$url" "$tmp/c" \
+       && git -C "$tmp/c" cat-file -e "$pinned^{commit}" 2>/dev/null \
+       && git -C "$tmp/c" checkout -q "$branch" \
+       && git -C "$tmp/c" reset --hard -q "$pinned"; then
+      mkdir -p "$(dirname "$dir")"; mv "$tmp/c" "$dir"; echo "  ${grn}cloned $name @ ${pinned:0:8}${rst}"
+    else echo "  ${ylw}clone failed/verify failed: $name${rst}"; fi
+    rm -rf "$tmp"
   done
 fi
