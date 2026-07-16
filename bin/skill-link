@@ -56,7 +56,7 @@ done
 
 # clone external skills at their pinned commit (content not vendored; only pins tracked).
 # fail-closed: verify an existing clone's origin + HEAD==pin; fresh clone lands atomically.
-MANIFEST="$REPO_ROOT/external-skills.tsv"
+MANIFEST="${SKILL_SYNC_MANIFEST:-$REPO_ROOT/external-skills.tsv}"
 if [ -f "$MANIFEST" ]; then
   echo "external skills (pinned clones)"
   grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$MANIFEST" | while IFS=$'\t' read -r name url branch pinned target; do
@@ -67,6 +67,8 @@ if [ -f "$MANIFEST" ]; then
       elif [ "$h" != "$pinned" ]; then echo "  ${ylw}$name: HEAD ${h:0:8} != pinned ${pinned:0:8} (use skill-sync)${rst}"
       else echo "  ${dim}ok   $name (@ ${pinned:0:8})${rst}"; fi
       continue
+    elif [ -e "$dir" ] || [ -L "$dir" ]; then
+      echo "  ${ylw}$name: $dir exists but is not a git repo — move it aside, skipping${rst}"; continue
     fi
     if [ "$CHECK" = 1 ]; then echo "  ${ylw}would clone $url -> $dir @ ${pinned:0:8}${rst}"; continue; fi
     tmp=$(mktemp -d)
@@ -74,8 +76,13 @@ if [ -f "$MANIFEST" ]; then
        && git -C "$tmp/c" cat-file -e "$pinned^{commit}" 2>/dev/null \
        && git -C "$tmp/c" checkout -q "$branch" \
        && git -C "$tmp/c" reset --hard -q "$pinned"; then
-      mkdir -p "$(dirname "$dir")"; mv "$tmp/c" "$dir"; echo "  ${grn}cloned $name @ ${pinned:0:8}${rst}"
-    else echo "  ${ylw}clone failed/verify failed: $name${rst}"; fi
+      mkdir -p "$(dirname "$dir")"
+      if mv "$tmp/c" "$dir" 2>/dev/null \
+         && [ "$(git -C "$dir" remote get-url origin 2>/dev/null)" = "$url" ] \
+         && [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" = "$pinned" ]; then
+        echo "  ${grn}cloned $name @ ${pinned:0:8}${rst}"
+      else echo "  ${ylw}$name: post-move verification failed${rst}"; fi
+    else echo "  ${ylw}clone/verify failed: $name${rst}"; fi
     rm -rf "$tmp"
   done
 fi
