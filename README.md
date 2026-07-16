@@ -60,7 +60,7 @@ skill-sync apply   <name>                     # verify + ff-only + re-pin manife
 ### Own repo / any git repo (by directory)
 
 ```bash
-skill-sync inspect      <dir> [branch]        # same review bundle + gates for HEAD..origin/branch
+skill-sync inspect      <dir>                  # same review bundle + gates for HEAD..origin (current branch)
 skill-sync approve-repo <dir> <reviewer-id> <report-file>
 skill-sync apply-repo   <dir>                 # verify + ff-only pull (no manifest re-pin)
 ```

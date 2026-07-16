@@ -43,12 +43,12 @@ scan_added(){ # stdin=diff -> hits; return 1 if any (supplementary text gate)
 }
 
 inspect_objects(){ # dir baseline cand outfile -> sets OBJ_BLOCK
-  local dir="$1" a="$2" c="$3" out="$4" bin_paths mark="$CACHE/.objblock.$$"
+  local dir="$1" a="$2" c="$3" out="$4" mark="$CACHE/.objblock.$$"
   OBJ_BLOCK=0; : > "$out"; rm -f "$mark"
-  bin_paths=$(git -C "$dir" diff --numstat "$a" "$c" | awk -F'\t' '$1=="-"&&$2=="-"{print $3}')
   git -C "$dir" diff --raw --abbrev=40 "$a" "$c" | while IFS=$'\t' read -r meta path rest; do
     set -- $meta                       # :oldmode newmode oldsha newsha status
     local oldmode="${1#:}" newmode="$2" newsha="$4" status="$5" flag="" size="-" osha="-"
+    [ -n "$rest" ] && path="$rest"      # rename/copy: --raw emits old<TAB>new; label the NEW path
     if [ "$newsha" != "$ZERO" ]; then
       size=$(git -C "$dir" cat-file -s "$newsha" 2>/dev/null || echo '?')
       osha=$(git -C "$dir" cat-file blob "$newsha" 2>/dev/null | sha256sum | awk '{print $1}')
@@ -58,7 +58,10 @@ inspect_objects(){ # dir baseline cand outfile -> sets OBJ_BLOCK
       160000) flag="SUBMODULE-BLOCK";;
       100755) [ "$oldmode" = "100755" ] || flag="EXEC-BIT-BLOCK";;
     esac
-    if printf '%s\n' "$bin_paths" | grep -qxF "$path"; then
+    # binary detection per-blob (independent of path/rename). Subshell disables pipefail so
+    # grep -q's early exit (SIGPIPE to git cat-file) cannot flip a large TEXT blob to binary.
+    if [ "$newsha" != "$ZERO" ] && [ "$size" != 0 ] && [ "$size" != '?' ] \
+       && ! ( set +o pipefail; git -C "$dir" cat-file blob "$newsha" 2>/dev/null | LC_ALL=C grep -Iq . ) ; then
       case "${path,,}" in
         *.png|*.jpg|*.jpeg|*.gif|*.webp|*.svg|*.ico|*.bmp) flag="${flag:+$flag }IMAGE-reviewer-decode";;
         *) flag="${flag:+$flag }BINARY-BLOCK";;
@@ -123,12 +126,12 @@ do_approve(){ # $1 reviewer  $2 report ; requires resolved T_*
   local rev="$1" report="$2"
   { [ -z "$rev" ] || [ -z "$report" ]; } && { echo "need <reviewer-id> <report-file>"; exit 2; }
   [ -s "$report" ] || { printf '%sreport missing/empty%s\n' "$red" "$rst"; exit 2; }
-  grep -qiE '^[[:space:]]*verdict:[[:space:]]*approved' "$report" || { printf '%sreport lacks `verdict: approved`%s\n' "$red" "$rst"; exit 2; }
+  grep -qiE '^[[:space:]]*verdict:[[:space:]]*approved[[:space:]]*$' "$report" || { printf '%sreport lacks `verdict: approved`%s\n' "$red" "$rst"; exit 2; }
   local cand; cand=$(fetch_candidate "$T_DIR" "$T_BRANCH") || { echo "fetch failed"; exit 1; }
   local base; base=$(base_for "$T_KEY" "$T_BASE" "$cand")
   { [ -f "$base.diff" ] && [ -f "$base.objects" ]; } || { printf '%sno bundle — run check/inspect first%s\n' "$red" "$rst"; exit 1; }
   if [ -f "$base.BLOCKED" ]; then
-    grep -qiE "^[[:space:]]*override-blocked:[[:space:]]*${cand:0:8}" "$report" || { printf '%sBLOCKED — report needs `override-blocked: %s`%s\n' "$red" "${cand:0:8}" "$rst"; exit 2; }
+    grep -qiE "^[[:space:]]*override-blocked:[[:space:]]*${cand:0:8}[[:space:]]*$" "$report" || { printf '%sBLOCKED — report needs `override-blocked: %s`%s\n' "$red" "${cand:0:8}" "$rst"; exit 2; }
   fi
   local dsha osha rsha; dsha=$(sha256 "$base.diff"); osha=$(sha256 "$base.objects"); rsha=$(sha256 "$report")
   cp "$report" "$base.report"

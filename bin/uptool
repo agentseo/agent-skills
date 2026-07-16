@@ -28,12 +28,12 @@ hdr(){ printf '\n%s== %s ==%s\n' "$bold" "$1" "$rst"; }
 ask(){ # $1 = prompt; returns 0 to proceed
   [ "$CHECK_ONLY" = 1 ] && return 1
   [ "$ASSUME_YES" = 1 ] && return 0
-  read -r -p "$1 [y/N] " a </dev/tty; [[ "$a" =~ ^[Yy]$ ]]
+  local a=""; read -r -p "$1 [y/N] " a </dev/tty || true; [[ "$a" =~ ^[Yy]$ ]]
 }
 # exec-tier confirm: NEVER auto-approved by -y (curl|sh must be seen). check mode = skip.
 ask_exec(){
   [ "$CHECK_ONLY" = 1 ] && return 1
-  read -r -p "$1 [y/N] " a </dev/tty; [[ "$a" =~ ^[Yy]$ ]]
+  local a=""; read -r -p "$1 [y/N] " a </dev/tty || true; [[ "$a" =~ ^[Yy]$ ]]
 }
 
 # ---------- omp (native self-update) ----------
