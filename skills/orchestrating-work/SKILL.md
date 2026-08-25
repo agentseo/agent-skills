@@ -92,6 +92,33 @@ Prefer read-only scouts for discovery. Prefer a separate reviewer/tester for fin
 | Designer | UX, hierarchy, visual system | Backend/data work |
 | SeoScout | Technical/content/schema/performance SEO findings | Non-SEO product decisions |
 
+## Mapping these roles onto omp
+
+The role names above are labels for the assignment, not agent types. Two separate things decide
+what actually runs:
+
+- **Agent type** — the `agent` field of the `task` tool. It selects the system prompt, tool set,
+  and read/write permission of the child.
+- **Model** — resolved from that agent's definition (`model:`, which may be a role alias such as
+  `@task`, `@slow`, `@smol`), falling back to `modelRoles.task`. With
+  `task.showResolvedModelBadge: true` the resolved model is shown on each spawn.
+
+| Role label above | `agent` to pass | Notes |
+|---|---|---|
+| SourceScout, ProductDataScout, DocsScout, ExploreAgent | `scout` | Read-only; returns compressed facts. Use for every discovery stream. |
+| SeoScout | `scout` | Same agent, SEO-shaped assignment; there is no dedicated SEO agent. |
+| StructurePlanner | `plan-fable` (plan document) or `task` | `plan-fable` writes a plan file and never edits source. |
+| ImplementationAgent | `task`, `exec-plan`, or `sonic` | `exec-plan` implements one written plan end-to-end; `sonic` is for strictly mechanical edits. |
+| Reviewer | `reviewer` or `code-reviewer` | `code-reviewer` checks a completed step against its plan; `security-reviewer` is the read-only security variant. |
+| Tester | `task` | No bundled tester agent: assign the test scope explicitly. |
+| Designer | `designer` | Runs on `modelRoles.designer`. |
+| (library/API questions) | `librarian` | Reads dependency source and answers definitively. |
+
+Model roles (`default`, `smol`, `tiny`, `slow`, `plan`, `designer`, `task`, `commit`, `advisor`,
+`vision`, `video`) are a routing table, not agent identities: they say *which model* answers, not
+*what job* it does. Do not name a model role in an assignment; pick the agent type and let role
+resolution choose the model.
+
 ## Required reviewer/spec-check phase
 
 For non-trivial deliverables, include one final review pass. The reviewer checks:

@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# uptool — unified update checker/installer for omp, claude, codex, rtk, skills.
+# uptool — unified update checker/installer for omp, claude, codex, rtk, herdr, skills.
 # Usage:
 #   uptool            # check everything, then prompt y/N per group to install
 #   uptool -c|--check # check only, never install (good for cron/login banner)
-#   uptool -y|--yes   # install all available updates without prompting
+#   uptool -y|--yes   # install omp + npm globals + herdr (stable) without prompting; rtk still asks
+#   uptool -a|--auto  # fully unattended: also reinstalls rtk (pinned + SHA-verified)
+# Skills are report-only in EVERY mode: applying a skill diff stays a reviewed step
+# (skill-sync approve/apply). Never automated here, not even under -a.
+# herdr on the preview channel is report-only too (installed build id is not comparable),
+# and no herdr install is ever attempted from inside a herdr session.
 set -uo pipefail
 
 # --- config: rtk has no self-update. Official update = brew, else re-run the installer.
@@ -16,11 +21,12 @@ RTK_PIN_SHA="5a7880d404db8364d602f2ecdc41dd790f64013f"
 RTK_INSTALL_SHA256="d6eb73a772903e13ff34ee1be8a8b24e896ba9a978f20d2279a08b4083ea6f77"
 SKILL_DIRS=("$HOME/.claude/skills" "$HOME/.omp/agent/skills")
 
-CHECK_ONLY=0; ASSUME_YES=0
+CHECK_ONLY=0; ASSUME_YES=0; AUTO_EXEC=0
 case "${1:-}" in
   -c|--check) CHECK_ONLY=1 ;;
   -y|--yes)   ASSUME_YES=1 ;;
-  -h|--help)  sed -n '2,7p' "$0"; exit 0 ;;
+  -a|--auto)  ASSUME_YES=1; AUTO_EXEC=1 ;;
+  -h|--help)  sed -n '2,11p' "$0"; exit 0 ;;
 esac
 
 bold=$'\e[1m'; dim=$'\e[2m'; grn=$'\e[32m'; ylw=$'\e[33m'; red=$'\e[31m'; rst=$'\e[0m'
@@ -30,9 +36,11 @@ ask(){ # $1 = prompt; returns 0 to proceed
   [ "$ASSUME_YES" = 1 ] && return 0
   local a=""; read -r -p "$1 [y/N] " a </dev/tty || true; [[ "$a" =~ ^[Yy]$ ]]
 }
-# exec-tier confirm: NEVER auto-approved by -y (curl|sh must be seen). check mode = skip.
+# exec-tier confirm: -y is NOT enough (curl|sh must be seen). Only -a auto-approves,
+# and only because the installer is pinned and its SHA-256 verified before it runs.
 ask_exec(){
   [ "$CHECK_ONLY" = 1 ] && return 1
+  [ "$AUTO_EXEC" = 1 ] && return 0
   local a=""; read -r -p "$1 [y/N] " a </dev/tty || true; [[ "$a" =~ ^[Yy]$ ]]
 }
 
@@ -41,19 +49,29 @@ hdr "omp"
 if command -v omp >/dev/null; then
   cur=$(omp --version 2>/dev/null)
   echo "installed: $cur"
-  if omp update -c 2>&1 | tee /tmp/uptool.omp | grep -qiE 'update|available|new version'; then
+  omp_out=$(timeout 60 omp update -c 2>&1); omp_rc=$?
+  printf '%s\n' "$omp_out" > /tmp/uptool.omp
+  if [ "$omp_rc" -ne 0 ]; then
+    # includes timeout (124) and omp's own "Failed to check for updates" (rc 1)
+    printf '%scheck failed (rc %s) — skipped, nothing installed%s\n' "$ylw" "$omp_rc" "$rst"
+    sed -n '1,4p' /tmp/uptool.omp
+  elif printf '%s\n' "$omp_out" | grep -qiE 'up[ -]?to[ -]?date|no (new )?updates?'; then
+    printf '%sup to date%s\n' "$grn" "$rst"
+  else
+    # rc 0 without the up-to-date marker = something to install; `omp update` is a no-op if not
     printf '%supdate available%s\n' "$ylw" "$rst"; sed -n '1,4p' /tmp/uptool.omp
     if ask "install omp update (+plugins)?"; then omp update && omp update -l; fi
-  else
-    printf '%sup to date%s\n' "$grn" "$rst"
   fi
 else echo "${dim}omp not found${rst}"; fi
 
 # ---------- npm globals: claude + codex ----------
 hdr "npm globals (claude, codex)"
 if command -v npm >/dev/null; then
-  out=$(npm outdated -g 2>/dev/null | grep -Ei '@anthropic-ai/claude-code|@openai/codex')
-  if [ -n "$out" ]; then
+  npm_out=$(timeout 120 npm outdated -g 2>/dev/null); npm_rc=$?   # rc 1 = outdated found (normal)
+  out=$(printf '%s\n' "$npm_out" | grep -Ei '@anthropic-ai/claude-code|@openai/codex')
+  if [ "$npm_rc" -gt 1 ]; then
+    printf '%scheck failed (rc %s; 124 = 120s timeout) — skipped, nothing installed%s\n' "$ylw" "$npm_rc" "$rst"
+  elif [ -n "$out" ]; then
     printf '%s%-32s %-10s %-10s%s\n' "$dim" "package" "current" "latest" "$rst"
     echo "$out" | awk '{printf "%-32s %-10s %-10s\n",$1,$2,$4}'
     if ask "npm -g install latest for these?"; then
@@ -82,7 +100,7 @@ rtk_reinstall(){ # download pinned install.sh, verify sha256, then run
 hdr "rtk"
 if command -v rtk >/dev/null; then
   cur=$(rtk --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-  latest=$(gh api "repos/$RTK_REPO/releases/latest" --jq .tag_name 2>/dev/null | sed 's/^v//')
+  latest=$(timeout 30 gh api "repos/$RTK_REPO/releases/latest" --jq .tag_name 2>/dev/null | sed 's/^v//')
   echo "installed: ${cur:-?}   latest: ${latest:-unknown}"
   if [ -z "$latest" ]; then
     printf '%scould not resolve latest release — skipping%s\n' "$dim" "$rst"
@@ -95,11 +113,52 @@ if command -v rtk >/dev/null; then
   fi
 else echo "${dim}rtk not found${rst}"; fi
 
+# ---------- herdr (native self-update; manifest is the only check-only path) ----------
+# `herdr update` installs immediately — there is no --check — so compare against the same
+# manifest herdr itself uses. Two channels, two manifests:
+#   stable  -> latest.json  ("version": semver)  -> sort -V compare, install offered
+#   preview -> preview.json (build_id over base_version). There is no reliable way to read
+#              the INSTALLED preview build id, and semver compare is meaningless (preview
+#              base_version == stable). Fail closed: report the latest build, never install.
+# Never runs the updater from inside a herdr session — herdr itself refuses (detach first).
+hdr "herdr"
+if command -v herdr >/dev/null; then
+  cur=$(herdr --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  chan=$(herdr channel show 2>/dev/null | grep -oE 'preview|stable' | head -1)
+  if [ "$chan" = "preview" ]; then
+    mani=$(timeout 30 curl -fsSL https://herdr.dev/preview.json 2>/dev/null)
+    base=$(printf '%s' "$mani" | jq -r '.base_version // empty' 2>/dev/null)
+    build=$(printf '%s' "$mani" | jq -r '.build_id // empty' 2>/dev/null)
+    echo "installed: ${cur:-?}   channel: preview"
+    if [ -z "$build" ]; then
+      printf '%scould not fetch https://herdr.dev/preview.json — skipping%s\n' "$dim" "$rst"
+    else
+      printf '%slatest preview: %s build %s — cannot compare installed build id%s\n' "$ylw" "${base:-?}" "$build" "$rst"
+      printf '%sreport-only on preview; run `herdr update` yourself (outside a herdr session)%s\n' "$dim" "$rst"
+    fi
+  else
+    latest=$(timeout 30 curl -fsSL https://herdr.dev/latest.json 2>/dev/null | jq -r '.version // empty' 2>/dev/null)
+    echo "installed: ${cur:-?}   latest: ${latest:-unknown}   channel: ${chan:-stable}"
+    if [ -z "$latest" ]; then
+      printf '%scould not fetch https://herdr.dev/latest.json — skipping%s\n' "$dim" "$rst"
+    elif [ "$cur" = "$latest" ] || [ "$(printf '%s\n%s\n' "$latest" "$cur" | sort -V | tail -1)" = "$cur" ]; then
+      printf '%sup to date%s\n' "$grn" "$rst"
+    elif [ -n "${HERDR_PANE_ID:-}" ]; then
+      printf '%supdate available %s -> %s — but this shell is inside a herdr session%s\n' "$ylw" "$cur" "$latest" "$rst"
+      printf '%sdetach first, then run: herdr update%s\n' "$dim" "$rst"
+    else
+      printf '%supdate available %s -> %s%s\n' "$ylw" "$cur" "$latest" "$rst"
+      if ask "run herdr update?"; then herdr update; fi
+    fi
+  fi
+else echo "${dim}herdr not found${rst}"; fi
+
 # ---------- own skills repo (~/skills = single source of truth) ----------
 SKILLS_REPO="$HOME/skills"
 hdr "own skills (~/skills)"
 if [ -d "$SKILLS_REPO/.git" ]; then
-  git -C "$SKILLS_REPO" fetch -q 2>/dev/null
+  timeout 60 git -C "$SKILLS_REPO" fetch -q 2>/dev/null \
+    || printf '%sfetch failed/timed out — comparison below may be stale%s\n' "$ylw" "$rst"
   if counts=$(git -C "$SKILLS_REPO" rev-list --left-right --count HEAD...@{u} 2>/dev/null); then
     ahead=${counts%%[[:space:]]*}; behind=${counts##*[[:space:]]}
     if   [ "$behind" -gt 0 ] && [ "$ahead" -eq 0 ]; then
@@ -117,7 +176,8 @@ else printf '%s~/skills is not a git repo — clone it and run bin/skill-link%s\
 # ---------- external (third-party) skills: fail-closed via skill-sync ----------
 hdr "external skills (skill-sync check)"
 if [ -x "$SKILLS_REPO/bin/skill-sync" ]; then
-  "$SKILLS_REPO/bin/skill-sync" check   # read-only; applying is a separate reviewed step
+  timeout 180 "$SKILLS_REPO/bin/skill-sync" check   # read-only; applying is a separate reviewed step
+  [ $? -ge 124 ] && printf '%sskill-sync check timed out (180s) — status unknown%s\n' "$ylw" "$rst"
 else printf '%sskill-sync not found at %s/bin%s\n' "$dim" "$SKILLS_REPO" "$rst"; fi
 
 # ---------- skill link map ----------
