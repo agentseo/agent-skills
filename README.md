@@ -1,7 +1,10 @@
 # agent-skills
 
-Private source of truth for my own Claude Code / OMP agent skills, plus fail-closed tooling
-for updating both my own skills and third-party ones.
+Source of truth for a set of Claude Code / OMP agent skills, plus fail-closed tooling for
+updating both the skills kept here and third-party ones pinned by commit.
+
+The skills are written for one person's workflow: every account-specific value (GitHub owner,
+project board ids, repository lists) is a placeholder you fill in your own `CLAUDE.md`.
 
 ## Layout
 

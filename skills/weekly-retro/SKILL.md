@@ -38,7 +38,7 @@ Your GitHub username or org for issue search:
 
 Project board where retro issues land:
 
-- project_id: 7
+- project_id: N
 
 ### Canonical files (single source of truth)
 
