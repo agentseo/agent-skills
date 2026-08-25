@@ -102,28 +102,31 @@ like `@task`/`@slow`), falling back to `modelRoles.task`.
 One stream gets exactly one agent. Walk the ladder top-down and stop at the first match — never
 "one of these three":
 
-| # | Condition on the stream | `agent` |
-|---|---|---|
-| 1 | Answers a question about a third-party library/API by reading its source | `librarian` |
-| 2 | Gathers facts, maps code, crawls URLs, inspects documents — changes nothing | `scout` |
-| 3 | Judges security only, and must not write | `security-reviewer` |
-| 4 | Checks a finished step against the plan it was supposed to follow | `code-reviewer` |
-| 5 | Reviews quality/risks/regressions where no written plan exists | `reviewer` |
-| 6 | Produces a plan document and must not touch source | `plan-fable` |
-| 7 | Implements a plan that already exists as a file under `.planning/quick/*/N-PLAN.md` | `exec-plan` |
-| 8 | Edits UI/UX, visual hierarchy, design system | `designer` |
-| 9 | Applies a purely mechanical change with no decisions (rename, bulk substitution, data collection) | `sonic` |
-| 10 | Anything else that writes code, tests, or config | `task` |
+| # | Condition on the stream | `agent` | Model it resolves to |
+|---|---|---|---|
+| 1 | Answers a question about a third-party library/API by reading its source | `librarian` | `@task` |
+| 2 | Gathers facts, maps code, crawls URLs, inspects documents — changes nothing | `scout` | `@task` |
+| 3 | Judges security only, and must not write | `security-reviewer` | `@slow` |
+| 4 | Checks a finished step against the plan it was supposed to follow | `code-reviewer` | `@slow` |
+| 5 | Reviews quality/risks/regressions where no written plan exists | `reviewer` | `@slow` |
+| 6 | Produces a plan document and must not touch source | `plan-fable` | `@plan` |
+| 7 | Implements a plan that already exists as a file under `.planning/quick/*/N-PLAN.md` | `exec-plan` | `@task` |
+| 8 | Edits UI/UX, visual hierarchy, design system | `designer` | `@designer` |
+| 9 | Applies a purely mechanical change with no decisions (rename, bulk substitution, data collection) | `sonic` | `@tiny` |
+| 10 | Anything else that writes code, tests, or config | `task` | `@task` |
 
 Ties are resolved by the ladder, not by taste: a security review of a finished step is row 3, not
 row 4, because "must not write" is the stronger constraint. A test-writing stream is row 10 —
 there is no bundled tester agent, so state the test scope in the assignment instead.
 
+The model column is not advice: it is pinned in `task.agentModelOverrides`, which resolves before
+an agent's own default. Judgement streams (rows 3–5) run on `@slow` because a cheap reviewer
+approves broken work; gathering and mechanical rows run on subscription-cheap models.
+
 Model roles (`default`, `smol`, `tiny`, `slow`, `plan`, `designer`, `task`, `commit`, `advisor`,
 `vision`, `video`) are a routing table, not agent identities: they say *which model* answers, not
 *what job* it does. The `task` tool takes no model argument, so never name a role in an
-assignment — pick the row above and let the agent definition (or `task.agentModelOverrides`)
-resolve the model.
+assignment — pick the row above; the override table resolves the model.
 
 ## Required reviewer/spec-check phase
 
