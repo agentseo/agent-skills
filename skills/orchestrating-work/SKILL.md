@@ -92,32 +92,38 @@ Prefer read-only scouts for discovery. Prefer a separate reviewer/tester for fin
 | Designer | UX, hierarchy, visual system | Backend/data work |
 | SeoScout | Technical/content/schema/performance SEO findings | Non-SEO product decisions |
 
-## Mapping these roles onto omp
+## Choosing the agent (deterministic)
 
-The role names above are labels for the assignment, not agent types. Two separate things decide
-what actually runs:
+The role names above are labels for the assignment, not agent types. What actually runs is the
+`agent` field of the `task` tool: it selects the system prompt, tool set, and write permission of
+the child. Its model is resolved from that agent's definition (`model:`, possibly a role alias
+like `@task`/`@slow`), falling back to `modelRoles.task`.
 
-- **Agent type** — the `agent` field of the `task` tool. It selects the system prompt, tool set,
-  and read/write permission of the child.
-- **Model** — resolved from that agent's definition (`model:`, which may be a role alias such as
-  `@task`, `@slow`, `@smol`), falling back to `modelRoles.task`. With
-  `task.showResolvedModelBadge: true` the resolved model is shown on each spawn.
+One stream gets exactly one agent. Walk the ladder top-down and stop at the first match — never
+"one of these three":
 
-| Role label above | `agent` to pass | Notes |
+| # | Condition on the stream | `agent` |
 |---|---|---|
-| SourceScout, ProductDataScout, DocsScout, ExploreAgent | `scout` | Read-only; returns compressed facts. Use for every discovery stream. |
-| SeoScout | `scout` | Same agent, SEO-shaped assignment; there is no dedicated SEO agent. |
-| StructurePlanner | `plan-fable` (plan document) or `task` | `plan-fable` writes a plan file and never edits source. |
-| ImplementationAgent | `task`, `exec-plan`, or `sonic` | `exec-plan` implements one written plan end-to-end; `sonic` is for strictly mechanical edits. |
-| Reviewer | `reviewer` or `code-reviewer` | `code-reviewer` checks a completed step against its plan; `security-reviewer` is the read-only security variant. |
-| Tester | `task` | No bundled tester agent: assign the test scope explicitly. |
-| Designer | `designer` | Runs on `modelRoles.designer`. |
-| (library/API questions) | `librarian` | Reads dependency source and answers definitively. |
+| 1 | Answers a question about a third-party library/API by reading its source | `librarian` |
+| 2 | Gathers facts, maps code, crawls URLs, inspects documents — changes nothing | `scout` |
+| 3 | Judges security only, and must not write | `security-reviewer` |
+| 4 | Checks a finished step against the plan it was supposed to follow | `code-reviewer` |
+| 5 | Reviews quality/risks/regressions where no written plan exists | `reviewer` |
+| 6 | Produces a plan document and must not touch source | `plan-fable` |
+| 7 | Implements a plan that already exists as a file under `.planning/quick/*/N-PLAN.md` | `exec-plan` |
+| 8 | Edits UI/UX, visual hierarchy, design system | `designer` |
+| 9 | Applies a purely mechanical change with no decisions (rename, bulk substitution, data collection) | `sonic` |
+| 10 | Anything else that writes code, tests, or config | `task` |
+
+Ties are resolved by the ladder, not by taste: a security review of a finished step is row 3, not
+row 4, because "must not write" is the stronger constraint. A test-writing stream is row 10 —
+there is no bundled tester agent, so state the test scope in the assignment instead.
 
 Model roles (`default`, `smol`, `tiny`, `slow`, `plan`, `designer`, `task`, `commit`, `advisor`,
 `vision`, `video`) are a routing table, not agent identities: they say *which model* answers, not
-*what job* it does. Do not name a model role in an assignment; pick the agent type and let role
-resolution choose the model.
+*what job* it does. The `task` tool takes no model argument, so never name a role in an
+assignment — pick the row above and let the agent definition (or `task.agentModelOverrides`)
+resolve the model.
 
 ## Required reviewer/spec-check phase
 
