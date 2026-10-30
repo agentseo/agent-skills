@@ -56,6 +56,11 @@ Claim with \`bd update <id> --claim --json\`; full bd manual: \`bd prime\` (only
 $ready"
 fi
 
+# memory is loaded into every session: keep it to guardrails and pointers
+if [ -n "$mem" ] && [ "${#mem}" -gt 2500 ]; then
+  text="$text${text:+$'\n\n'}⚠ beads-context: project memory is ${#mem} chars — move content to files/bead notes, keep only guardrails and pointers (~/.agents/AGENTS.md, «Beads memory»)."
+fi
+
 # drift: per-project hooks from `bd init` came back
 drift=""
 grep -qs 'bd prime' "$root"/.claude/settings*.json && drift="$drift .claude/settings.json"
