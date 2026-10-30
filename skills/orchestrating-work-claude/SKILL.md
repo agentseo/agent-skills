@@ -153,6 +153,8 @@ Dolt allows one writer, so parallel `bd` writes queue on the lock.
 
 - The main session creates, claims and closes beads; the executor gets the bead id and its
   acceptance criterion in the prompt.
+- Project memories (`bd remember`) reach the main session at start, not subagents: copy the
+  ones that bear on the task (access paths, «don't touch», client rules) into the assignment.
 - An executor may write progress only to its own bead: `bd update <id> --notes "<checkpoint>"`
   after each finished step — so if it hangs or dies, the next executor starts from the notes.
 - Findings outside scope come back in the report («noticed, not touched»); the main session turns

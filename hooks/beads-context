@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# beads-context — Beads memories + ready work for agent session context.
+# One script for every harness; each harness has a thin global adapter:
+#   beads-context                     plain text      (OMP extension beads-context.ts)
+#   beads-context --claude            SessionStart JSON (~/.claude/settings.json)
+#   beads-context --codex start       SessionStart JSON (~/.codex/hooks.json)
+#   beads-context --codex postcompact mark session for refresh, no output
+#   beads-context --codex prompt      UserPromptSubmit JSON once after a compaction
+# Replaces the per-project hooks `bd init` installs (`bd prime --hook-json`,
+# `bd codex-hook`): those inject ~5 KB of bd manual on every start; this injects
+# only `bd prime --memories-only` and `bd ready`.
+# Never fails a session start: any error or timeout -> whatever was collected, exit 0.
+set -uo pipefail
+
+MODE="plain"; CODEX_EVENT=""
+case "${1:-}" in
+  --claude) MODE="claude" ;;
+  --codex)  MODE="codex"; CODEX_EVENT="${2:-start}" ;;
+esac
+
+BUDGET=5   # seconds per bd call
+STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/beads-context"
+
+# hook payload (Claude/Codex pass JSON on stdin; OMP passes nothing)
+payload=""; [ "$MODE" = plain ] || [ -t 0 ] || payload="$(timeout 1 cat 2>/dev/null || true)"
+field(){ printf '%s' "$payload" | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('$1') or '')
+except Exception: pass" 2>/dev/null; }
+
+cwd="$(field cwd)"; session="$(field session_id)"
+[ -n "$cwd" ] || cwd="${CLAUDE_PROJECT_DIR:-$PWD}"
+root="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$cwd")"
+[ -d "$root/.beads" ] || exit 0
+command -v bd >/dev/null 2>&1 || exit 0
+
+flag="$STATE_DIR/${session:-nosession}.compacted"
+if [ "$MODE" = codex ] && [ "$CODEX_EVENT" = postcompact ]; then
+  mkdir -p "$STATE_DIR" && touch "$flag"; exit 0
+fi
+if [ "$MODE" = codex ] && [ "$CODEX_EVENT" = prompt ]; then
+  [ -f "$flag" ] || exit 0
+  rm -f "$flag"
+fi
+
+text=""
+mem="$(cd "$root" && timeout "$BUDGET" bd prime --memories-only 2>/dev/null)"
+if [ -n "$mem" ] && ! printf '%s' "$mem" | grep -q 'No memories stored'; then
+  # replace bd's English preamble with one that names the recovery command
+  text="If this block looks cut off, run \`bd prime --memories-only\` to read every memory.
+$(printf '%s\n' "$mem" | sed '1{/^\[bd prime\]/d}')"
+fi
+ready="$(cd "$root" && timeout "$BUDGET" bd ready --readonly -q -n 10 --plain 2>/dev/null)"
+if [ -n "$ready" ]; then
+  text="$text${text:+$'\n\n'}# Beads ready work
+Claim with \`bd update <id> --claim --json\`; full bd manual: \`bd prime\` (only when needed).
+$ready"
+fi
+
+# drift: per-project hooks from `bd init` came back
+drift=""
+grep -qs 'bd prime' "$root"/.claude/settings*.json && drift="$drift .claude/settings.json"
+grep -qs 'bd codex-hook' "$root/.codex/hooks.json" && drift="$drift .codex/hooks.json"
+[ -n "$drift" ] && text="$text${text:+$'\n\n'}⚠ beads-context: per-project bd hooks found in:$drift — global hooks already cover this; remove them (see ~/projects/omp/unified-agent-hooks-plan.md)."
+
+[ -n "$text" ] || exit 0
+
+case "$MODE" in
+  plain) printf '%s\n' "$text" ;;
+  claude|codex)
+    event="SessionStart"; [ "$CODEX_EVENT" = prompt ] && event="UserPromptSubmit"
+    # Claude/Codex move hook context over ~10k chars into a file and show only a short
+    # preview, so oversized memory is condensed to one line per key.
+    printf '%s' "$text" | EVENT="$event" python3 -c '
+import json, os, sys
+text = sys.stdin.read(); LIMIT = 9000
+if len(text) > LIMIT:
+    head, sep, tail = text.partition("# Beads ready work")
+    out, take = [], False
+    for line in head.split("\n"):
+        if line.startswith("### "):
+            out.append(line); take = True
+        elif take and line.strip():
+            out.append(line[:160] + ("…" if len(line) > 160 else "")); take = False
+        elif not take and not line.startswith("### ") and (line.startswith("#") or not out):
+            out.append(line)
+        elif not line.strip() and out and out[-1]:
+            out.append("")
+    note = "Memories condensed to one line each; full text: `bd memories <key>` or `bd prime --memories-only`.\n"
+    text = (note + "\n".join(out).rstrip() + "\n\n" + sep + tail)[:LIMIT]
+print(json.dumps({"hookSpecificOutput": {"hookEventName": os.environ["EVENT"], "additionalContext": text}}))' ;;
+esac
+exit 0

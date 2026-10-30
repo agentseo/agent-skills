@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# One-time switch of Claude Code to the shared beads-context hook.
+#  1. adds a global SessionStart hook to ~/.claude/settings.json (backup alongside);
+#  2. removes `bd prime --hook-json` SessionStart hooks from the projects' .claude/settings.json
+#     (tracked in git — revert with `git -C <project> checkout -- .claude/settings.json`).
+# Run by the owner: Claude Code may not edit its own hook config.
+set -euo pipefail
+ts=$(date +%Y%m%d-%H%M%S)
+cp ~/.claude/settings.json ~/.claude/settings.json.bak-"$ts"
+echo "backup: ~/.claude/settings.json.bak-$ts"
+python3 - "$@" <<'EOF'
+import json, os, sys
+H = os.path.expanduser('~')
+cmd = f'{H}/.local/bin/beads-context --claude'
+
+p = f'{H}/.claude/settings.json'
+d = json.load(open(p))
+ss = d.setdefault('hooks', {}).setdefault('SessionStart', [])
+if any('beads-context' in c.get('command', '') for e in ss for c in e.get('hooks', [])):
+    print('global: already installed')
+else:
+    ss.append({'matcher': '^(startup|resume|clear|compact)$',
+               'hooks': [{'type': 'command', 'command': cmd, 'timeout': 15}]})
+    open(p, 'w').write(json.dumps(d, indent=2, ensure_ascii=False) + '\n')
+    print('global: SessionStart beads-context added')
+
+projects = sys.argv[1:] or ('badmbot vaodent autoschet.ru nfcom.ru Server detailing reels '
+                            'seo-tool Autoimmun pojkom labmd pozhrukav frezograd').split()
+for name in projects:
+    f = f'{H}/projects/{name}/.claude/settings.json'
+    if not os.path.exists(f):
+        print(f'{name}: no .claude/settings.json'); continue
+    d = json.load(open(f)); h = d.get('hooks', {}); removed = 0
+    for ev in list(h):
+        keep = []
+        for e in h[ev]:
+            hs = [c for c in e.get('hooks', []) if 'bd prime' not in c.get('command', '')]
+            removed += len(e.get('hooks', [])) - len(hs)
+            if hs:
+                e['hooks'] = hs; keep.append(e)
+        if keep: h[ev] = keep
+        else: del h[ev]
+    if not h and 'hooks' in d: del d['hooks']
+    open(f, 'w').write(json.dumps(d, indent=2, ensure_ascii=False) + '\n')
+    print(f'{name}: removed {removed}')
+EOF

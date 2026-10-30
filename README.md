@@ -14,6 +14,8 @@ bin/skill-link           bootstrap: symlink skills into ~/.claude/skills; OMP-on
 bin/skill-sync           fail-closed updater (external skills + any git repo, incl. this one)
 bin/uptool               updater across omp, npm globals, grok, herdr (+integrations), rtk, skills
 external-skills.tsv       third-party skills — only their reviewed/pinned commit is tracked
+hooks/<name>             shared hook scripts, one logic for Claude/Codex/OMP (linked into ~/.local/bin)
+adapters/omp/*.ts        OMP extensions calling hooks/* (linked into ~/.omp/agent/extensions)
 ```
 
 Skills are the **source of truth in this repo** and are **symlinked** into the agent dirs —
