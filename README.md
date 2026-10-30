@@ -10,9 +10,9 @@ project board ids, repository lists) is a placeholder you fill in your own `CLAU
 
 ```
 skills/<name>/SKILL.md   my own skills — edited here, symlinked into the agent dirs
-bin/skill-link           bootstrap: symlink every skill into ~/.claude/skills (+ ~/.omp/agent/skills)
+bin/skill-link           bootstrap: symlink skills into ~/.claude/skills; OMP-only ones into ~/.omp/agent/skills
 bin/skill-sync           fail-closed updater (external skills + any git repo, incl. this one)
-bin/uptool               status/updater across omp, npm globals, rtk, this repo, external skills
+bin/uptool               updater across omp, npm globals, grok, herdr (+integrations), rtk, skills
 external-skills.tsv       third-party skills — only their reviewed/pinned commit is tracked
 ```
 
@@ -25,7 +25,9 @@ git clone git@github.com:agentseo/agent-skills.git ~/skills
 ```
 
 `skill-link` is idempotent and does everything a new machine needs: symlinks each skill into
-`~/.claude/skills` (+ `~/.omp/agent/skills` for the OMP-scoped ones), symlinks `skill-sync`,
+`~/.claude/skills`, the OMP-only ones (`OMP_ONLY`: `omp-ruki-agenty`, `orchestrating-work`)
+into `~/.omp/agent/skills` instead, and Claude variants (`CLAUDE_AS`, e.g.
+`orchestrating-work-claude` → `~/.claude/skills/orchestrating-work`) under their Claude name; symlinks `skill-sync`,
 `skill-link`, and `uptool` into `~/.local/bin` (repo stays the single source of truth), and
 clones each external skill into its target at its pinned commit. Ensure `~/.local/bin` is on
 `PATH`.
@@ -73,9 +75,21 @@ The object inspector fails closed on newly-added **symlinks** (mode 120000), **s
 to decode. Every `apply`/`apply-repo` requires an interactive confirmation and is never
 auto-approved.
 
-## Status overview
+## Status overview / auto-updates
 
-`bin/uptool` reports update status in one place: omp (`omp update`), npm globals (claude,
-codex), rtk (version-gated, pinned+verified installer), this repo (via `skill-sync inspect`,
-never auto-pulled), and external skills (via `skill-sync check`). `uptool --check` reports only;
-`uptool` prompts per group; installs/pulls are never auto for exec-tier actions even under `-y`.
+`bin/uptool` is the single entry point for keeping the toolchain current. Two tiers:
+
+**Auto tier — installed without prompting** (vendor self-updaters and npm, i.e. code paths the
+vendor already owns): omp (`omp update` + `omp update -l`), npm globals (claude, codex),
+grok (`grok update`, gated on `grok update --check --json`), herdr (`herdr update`, gated on
+`herdr.dev/latest.json`), and **herdr integrations** — `herdr update` does not refresh the
+agent-side hooks, so `uptool` reinstalls every integration reported `outdated` by
+`herdr integration status`. Integrations marked `not installed` are never added.
+
+**Exec / review tier — never automatic:** rtk (pinned + SHA-256-verified `curl | sh`, only under
+`-a`), this repo (via `skill-sync inspect`, never auto-pulled), and external skills (via
+`skill-sync check`). herdr is also skipped while the shell is inside a herdr session
+(`HERDR_PANE_ID` set) — detach and run `herdr update` manually.
+
+`uptool --check` reports only and installs nothing; `-y` is a no-op kept for scripts;
+`-a` additionally reinstalls rtk.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # skill-link — symlink every skill in this repo into the agent skill dirs.
 # Idempotent. Run after cloning ~/skills on a new machine.
-#   skill-link            # link into ~/.claude/skills (+ ~/.omp/agent/skills for omp-* / orchestrating-work)
+#   skill-link            # link into ~/.claude/skills; OMP-only skills into ~/.omp/agent/skills
 #   skill-link --check    # report only, make no changes
 set -uo pipefail
 
@@ -9,15 +9,17 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$REPO_ROOT/skills"
 CLAUDE_DIR="$HOME/.claude/skills"
 OMP_DIR="$HOME/.omp/agent/skills"
-# skills that also belong in the OMP agent dir
-OMP_ALSO="omp-ruki-agenty orchestrating-work"
+# skills that live only in the OMP agent dir (built on OMP agents/model roles)
+OMP_ONLY="omp-ruki-agenty orchestrating-work"
+# Claude-specific variants: <source dir>:<skill name in ~/.claude/skills>
+CLAUDE_AS="orchestrating-work-claude:orchestrating-work"
 
 CHECK=0; [ "${1:-}" = "--check" ] && CHECK=1
 grn=$'\e[32m'; ylw=$'\e[33m'; dim=$'\e[2m'; rst=$'\e[0m'
 
-link_one(){ # $1 = skill name, $2 = dest dir
+link_one(){ # $1 = skill name, $2 = dest dir, $3 = source dir name (default: $1)
   local name="$1" dir="$2" dest target
-  dest="$dir/$name"; target="$SRC/$name"
+  dest="$dir/$name"; target="$SRC/${3:-$1}"
   if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$target" ]; then
     echo "  ${dim}ok   $dest${rst}"; return
   fi
@@ -31,13 +33,30 @@ link_one(){ # $1 = skill name, $2 = dest dir
   echo "  ${grn}link $dest -> $target${rst}"
 }
 
+is_in(){ case " $2 " in *" $1 "*) return 0;; esac; return 1; }
+variant_srcs=""; for pair in $CLAUDE_AS; do variant_srcs="$variant_srcs ${pair%%:*}"; done
+
 echo "linking repo skills into $CLAUDE_DIR"
 for p in "$SRC"/*/; do
   [ -d "$p" ] || continue
-  link_one "$(basename "$p")" "$CLAUDE_DIR"
+  name="$(basename "$p")"
+  is_in "$name" "$OMP_ONLY $variant_srcs" && continue
+  link_one "$name" "$CLAUDE_DIR"
 done
-echo "linking omp-scoped skills into $OMP_DIR"
-for name in $OMP_ALSO; do
+for pair in $CLAUDE_AS; do
+  [ -d "$SRC/${pair%%:*}" ] && link_one "${pair#*:}" "$CLAUDE_DIR" "${pair%%:*}"
+done
+# drop stale Claude links to OMP-only skills (only symlinks into this repo are touched)
+for name in $OMP_ONLY; do
+  dest="$CLAUDE_DIR/$name"
+  is_in "$name" "$(for pair in $CLAUDE_AS; do printf '%s ' "${pair#*:}"; done)" && continue
+  if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$SRC/$name" ]; then
+    if [ "$CHECK" = 1 ]; then echo "  ${ylw}would unlink $dest (OMP-only)${rst}"
+    else rm -f "$dest"; echo "  ${grn}unlink $dest (OMP-only)${rst}"; fi
+  fi
+done
+echo "linking OMP-only skills into $OMP_DIR"
+for name in $OMP_ONLY; do
   [ -d "$SRC/$name" ] && link_one "$name" "$OMP_DIR"
 done
 
