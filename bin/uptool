@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# uptool — unified update checker/installer for omp, claude, codex, rtk, herdr, skills.
+# uptool — unified update checker/installer for omp, claude, codex, grok, rtk, herdr, skills.
 # Usage:
-#   uptool            # check everything, then prompt y/N per group to install
+#   uptool            # AUTO-installs omp, npm globals (claude/codex), herdr, grok and
+#                     # refreshes outdated herdr integrations; rtk still asks
 #   uptool -c|--check # check only, never install (good for cron/login banner)
-#   uptool -y|--yes   # install omp + npm globals + herdr (stable) without prompting; rtk still asks
+#   uptool -y|--yes   # same as bare run (kept for compatibility / explicit intent)
 #   uptool -a|--auto  # fully unattended: also reinstalls rtk (pinned + SHA-verified)
+# Auto tier = vendor self-updaters and npm, i.e. code paths the vendor already owns.
+# Exec tier (rtk: curl|sh) NEVER auto-runs without -a, even though it is pinned+verified.
 # Skills are report-only in EVERY mode: applying a skill diff stays a reviewed step
 # (skill-sync approve/apply). Never automated here, not even under -a.
 # herdr on the preview channel is report-only too (installed build id is not comparable),
 # and no herdr install is ever attempted from inside a herdr session.
+# herdr integrations are only REFRESHED, never newly installed: an integration that is
+# "not installed" stays untouched, an "outdated" one is reinstalled in place.
 set -uo pipefail
 
 # --- config: rtk has no self-update. Official update = brew, else re-run the installer.
@@ -21,20 +26,20 @@ RTK_PIN_SHA="5a7880d404db8364d602f2ecdc41dd790f64013f"
 RTK_INSTALL_SHA256="d6eb73a772903e13ff34ee1be8a8b24e896ba9a978f20d2279a08b4083ea6f77"
 SKILL_DIRS=("$HOME/.claude/skills" "$HOME/.omp/agent/skills")
 
-CHECK_ONLY=0; ASSUME_YES=0; AUTO_EXEC=0
+CHECK_ONLY=0; AUTO_EXEC=0
 case "${1:-}" in
   -c|--check) CHECK_ONLY=1 ;;
-  -y|--yes)   ASSUME_YES=1 ;;
-  -a|--auto)  ASSUME_YES=1; AUTO_EXEC=1 ;;
-  -h|--help)  sed -n '2,11p' "$0"; exit 0 ;;
+  -y|--yes)   ;;                          # auto tier is the default now; flag kept for scripts
+  -a|--auto)  AUTO_EXEC=1 ;;
+  -h|--help)  sed -n '2,16p' "$0"; exit 0 ;;
 esac
 
 bold=$'\e[1m'; dim=$'\e[2m'; grn=$'\e[32m'; ylw=$'\e[33m'; red=$'\e[31m'; rst=$'\e[0m'
 hdr(){ printf '\n%s== %s ==%s\n' "$bold" "$1" "$rst"; }
-ask(){ # $1 = prompt; returns 0 to proceed
+# auto tier: install unless --check. Vendor self-updaters + npm only.
+auto(){ # $1 = what we are about to do (logged, not asked)
   [ "$CHECK_ONLY" = 1 ] && return 1
-  [ "$ASSUME_YES" = 1 ] && return 0
-  local a=""; read -r -p "$1 [y/N] " a </dev/tty || true; [[ "$a" =~ ^[Yy]$ ]]
+  printf '%sauto: %s%s\n' "$dim" "$1" "$rst"; return 0
 }
 # exec-tier confirm: -y is NOT enough (curl|sh must be seen). Only -a auto-approves,
 # and only because the installer is pinned and its SHA-256 verified before it runs.
@@ -60,7 +65,7 @@ if command -v omp >/dev/null; then
   else
     # rc 0 without the up-to-date marker = something to install; `omp update` is a no-op if not
     printf '%supdate available%s\n' "$ylw" "$rst"; sed -n '1,4p' /tmp/uptool.omp
-    if ask "install omp update (+plugins)?"; then omp update && omp update -l; fi
+    if auto "omp update (+plugins)"; then omp update && omp update -l; fi
   fi
 else echo "${dim}omp not found${rst}"; fi
 
@@ -74,13 +79,33 @@ if command -v npm >/dev/null; then
   elif [ -n "$out" ]; then
     printf '%s%-32s %-10s %-10s%s\n' "$dim" "package" "current" "latest" "$rst"
     echo "$out" | awk '{printf "%-32s %-10s %-10s\n",$1,$2,$4}'
-    if ask "npm -g install latest for these?"; then
+    if auto "npm -g install latest"; then
       npm i -g @anthropic-ai/claude-code @openai/codex
     fi
   else
     printf '%sup to date%s\n' "$grn" "$rst"
   fi
 else echo "${dim}npm not found${rst}"; fi
+
+# ---------- grok (native self-update, has a real --check) ----------
+hdr "grok"
+if command -v grok >/dev/null; then
+  gj=$(timeout 30 grok update --check --json 2>/dev/null)
+  gcur=$(printf '%s' "$gj" | jq -r '.currentVersion // empty' 2>/dev/null)
+  glat=$(printf '%s' "$gj" | jq -r '.latestVersion // empty' 2>/dev/null)
+  gupd=$(printf '%s' "$gj" | jq -r '.updateAvailable // empty' 2>/dev/null)
+  gerr=$(printf '%s' "$gj" | jq -r '.error // empty' 2>/dev/null)
+  echo "installed: ${gcur:-?}   latest: ${glat:-unknown}"
+  if [ -z "$gupd" ] || [ -n "$gerr" ]; then
+    printf '%scheck failed%s — skipped, nothing installed\n' "$ylw" "$rst"
+    [ -n "$gerr" ] && echo "${dim}$gerr${rst}"
+  elif [ "$gupd" != "true" ]; then
+    printf '%sup to date%s\n' "$grn" "$rst"
+  else
+    printf '%supdate available %s -> %s%s\n' "$ylw" "$gcur" "$glat" "$rst"
+    if auto "grok update"; then grok update; fi
+  fi
+else echo "${dim}grok not found${rst}"; fi
 
 # ---------- rtk (no self-update: version-gated, pinned+verified installer) ----------
 rtk_reinstall(){ # download pinned install.sh, verify sha256, then run
@@ -148,7 +173,31 @@ if command -v herdr >/dev/null; then
       printf '%sdetach first, then run: herdr update%s\n' "$dim" "$rst"
     else
       printf '%supdate available %s -> %s%s\n' "$ylw" "$cur" "$latest" "$rst"
-      if ask "run herdr update?"; then herdr update; fi
+      if auto "herdr update"; then herdr update; fi
+    fi
+  fi
+else echo "${dim}herdr not found${rst}"; fi
+
+# ---------- herdr integrations (agent-side hooks; versioned apart from the binary) ----------
+# `herdr update` does NOT refresh these, so a stale hook silently degrades pane state
+# detection. Refresh only what is already installed: parse `integration status` and
+# reinstall every line marked "outdated". "not installed" is left alone on purpose.
+hdr "herdr integrations"
+if command -v herdr >/dev/null; then
+  ist=$(timeout 30 herdr integration status 2>/dev/null)
+  if [ -z "$ist" ]; then
+    printf '%scould not read integration status — skipping%s\n' "$dim" "$rst"
+  else
+    stale=$(printf '%s\n' "$ist" | grep -E ':[[:space:]]*outdated' | sed 's/[[:space:]]*(experimental)//' | cut -d: -f1)
+    if [ -z "$stale" ]; then
+      printf '%sall installed integrations up to date%s\n' "$grn" "$rst"
+    else
+      printf '%soutdated: %s%s\n' "$ylw" "$(echo $stale)" "$rst"
+      printf '%s\n' "$ist" | grep -E ':[[:space:]]*outdated' | sed "s/^/  ${dim}/;s/\$/${rst}/"
+      if auto "herdr integration install for: $(echo $stale)"; then
+        for i in $stale; do herdr integration install "$i" || printf '%s%s failed%s\n' "$red" "$i" "$rst"; done
+        printf '%s\n' "${dim}recheck:${rst}"; herdr integration status --outdated-only 2>&1
+      fi
     fi
   fi
 else echo "${dim}herdr not found${rst}"; fi
