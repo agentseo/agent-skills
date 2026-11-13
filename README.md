@@ -38,7 +38,9 @@ clones each external skill into its target at its pinned commit. Ensure `~/.loca
 
 - **Own skills** (`skills/`): authored/maintained by me. `ceo-council`, `claude-md-writer`,
   `manager`, `weekly-planning`, `weekly-retro` originated in my public
-  `serejaris/personal-corp-skills`; the rest are OMP/personal. Update = edit + commit + push.
+  `serejaris/personal-corp-skills`; the rest are OMP/personal. `drupal-dev` (shared by all Drupal projects) ships
+  executable helper scripts in `scripts/` — the skill-sync object inspector flags new
+  executables, so expect a reviewer override on first sync. Update = edit + commit + push.
 - **External skills** (`external-skills.tsv`): third-party repos (`humanizer-ru`,
   `threads-carousel`). Content is **not** vendored — only a reviewed, pinned commit. They live
   as read-only clones in `~/.claude/skills/<name>` and are **never edited in place**.
