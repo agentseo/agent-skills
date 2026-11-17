@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# commit-stamp — does an agent's `git commit` carry a `Verified:` line?
+# Rule (~/.agents/AGENTS.md): every commit message ends with `Verified: <how>` or
+# `Verified: none — <why>`. This hook measures and, later, enforces it.
+#   commit-stamp --claude        PreToolUse (Bash); payload JSON on stdin.
+#   commit-stamp --cmd '<cmd>'   plain (OMP adapter commit-stamp.ts).
+# Mode: COMMIT_STAMP_MODE = observe (default) | enforce | off.
+#   observe  every agent commit is logged (stamped or not); never blocks.
+#   enforce  a commit without `Verified:` is blocked (Claude: exit 2; plain: exit 1),
+#            except the third one in a session — two blocks, then let it through.
+# Log: ${XDG_STATE_HOME:-~/.local/state}/commit-stamp/log.tsv
+#   ts  mode  verdict(stamped|missing|unknown)  cwd  session  first-line
+# Never fails because of itself: internal errors -> exit 0.
+set -uo pipefail
+
+MODE_IN="plain"; CMD=""
+case "${1:-}" in
+  --claude) MODE_IN="claude" ;;
+  --cmd)    CMD="${2:-}" ;;
+esac
+MODE="${COMMIT_STAMP_MODE:-observe}"
+[ "$MODE" = off ] && exit 0
+
+cwd="$PWD"; session=""
+if [ "$MODE_IN" = claude ]; then
+  payload="$(timeout 1 cat 2>/dev/null || true)"
+  readarray -t f < <(printf '%s' "$payload" | python3 -c "import json,sys
+try:
+  d=json.load(sys.stdin); print(((d.get('tool_input') or {}).get('command') or '').replace('\n','\\\\n')); print(d.get('cwd') or ''); print(d.get('session_id') or '')
+except Exception: pass" 2>/dev/null)
+  CMD="${f[0]:-}"; CMD="${CMD//\\n/$'\n'}"; cwd="${f[1]:-$PWD}"; session="${f[2]:-}"
+fi
+
+# only real commits; not amend-without-message, not `git commit --help`
+printf '%s' "$CMD" | grep -qE '(^|[;&|[:space:]])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+commit([[:space:]]|$)' || exit 0
+printf '%s' "$CMD" | grep -qE 'commit[[:space:]]+(--help|-h)([[:space:]]|$)' && exit 0
+
+if printf '%s' "$CMD" | grep -q 'Verified:'; then verdict="stamped"
+elif printf '%s' "$CMD" | grep -qE '(-F|--file)[[:space:]=]'; then verdict="unknown"
+else verdict="missing"; fi
+
+first="$(printf '%s' "$CMD" | grep -oE -- "-m[[:space:]]*[\"'][^\"']{0,80}" | head -1 | sed -E "s/^-m[[:space:]]*[\"']//")"
+dir="${XDG_STATE_HOME:-$HOME/.local/state}/commit-stamp"; mkdir -p "$dir" 2>/dev/null
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -Is)" "$MODE" "$verdict" "$cwd" "$session" "${first//$'\t'/ }" >> "$dir/log.tsv" 2>/dev/null
+
+[ "$MODE" = enforce ] && [ "$verdict" = missing ] || exit 0
+key="${session:-nosession}"; cnt_file="$dir/blocks-$key"
+n="$(cat "$cnt_file" 2>/dev/null || echo 0)"
+if [ "$n" -ge 2 ]; then exit 0; fi
+echo $((n + 1)) > "$cnt_file"
+echo "Коммит без строки «Verified: <как проверено>» (или «Verified: none — <почему>»). Добавь её в сообщение." >&2
+[ "$MODE_IN" = claude ] && exit 2
+exit 1

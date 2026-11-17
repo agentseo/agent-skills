@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# uncommitted-reminder — one line when the agent stops with uncommitted changes in its repo.
+#   uncommitted-reminder --claude   Stop hook; prints {"systemMessage": ...} for the user, never blocks.
+#   uncommitted-reminder [dir]      plain (OMP adapter): prints the line or nothing.
+# With several sessions in one repo the count includes other sessions' edits — it is a hint only.
+set -uo pipefail
+MODE="plain"; dir="${1:-$PWD}"
+if [ "${1:-}" = "--claude" ]; then
+  MODE="claude"
+  payload="$(timeout 1 cat 2>/dev/null || true)"
+  dir="$(printf '%s' "$payload" | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('cwd') or '')
+except Exception: pass" 2>/dev/null)"; dir="${dir:-$PWD}"
+fi
+git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+n="$(timeout 3 git -C "$dir" status --porcelain 2>/dev/null | wc -l)"
+[ "${n:-0}" -gt 0 ] || exit 0
+root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)"
+msg="Незакоммичено в ${root/#$HOME/~}: $n файл(ов) — git status."
+if [ "$MODE" = claude ]; then
+  python3 -c 'import json,sys; print(json.dumps({"systemMessage": sys.argv[1]}, ensure_ascii=False))' "$msg"
+else
+  echo "$msg"
+fi
+exit 0

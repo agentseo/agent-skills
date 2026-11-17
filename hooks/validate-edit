@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# validate-edit — syntax check of a file the agent just wrote or edited.
+# One script for every harness:
+#   validate-edit --claude      PostToolUse (Edit|Write|MultiEdit); payload JSON on stdin.
+#                               Broken file -> message on stderr, exit 2 (Claude sees it and fixes).
+#   validate-edit <file>...     plain (OMP adapter validate-edit.ts); broken -> message, exit 1.
+# Checks: *.json (not JSONC: tsconfig, jsconfig, .vscode/, devcontainer, *.jsonc), *.py (py_compile),
+# *.php (php -l when php exists), *.yml/*.yaml (when PyYAML exists). Anything else / missing tool -> ok.
+# Never fails because of itself: internal errors -> exit 0.
+set -uo pipefail
+
+MODE="plain"
+if [ "${1:-}" = "--claude" ]; then MODE="claude"; shift; fi
+
+files=("$@")
+if [ "$MODE" = claude ]; then
+  payload="$(timeout 1 cat 2>/dev/null || true)"
+  f="$(printf '%s' "$payload" | python3 -c "import json,sys
+try: print((json.load(sys.stdin).get('tool_input') or {}).get('file_path') or '')
+except Exception: pass" 2>/dev/null)"
+  files=("$f")
+fi
+
+errors=""
+for f in "${files[@]}"; do
+  [ -n "$f" ] && [ -f "$f" ] || continue
+  out=""
+  case "$f" in
+    *.jsonc|*/tsconfig*.json|*/jsconfig*.json|*/.vscode/*.json|*/devcontainer.json|*/.devcontainer/*.json) ;;
+    *.json)
+      out="$(python3 -I -c "import json,sys
+try: json.load(open(sys.argv[1],encoding='utf-8'))
+except Exception as e: print(e)" "$f" 2>&1)" ;;
+    *.py)
+      out="$(python3 -I -c "import sys
+try: compile(open(sys.argv[1],'rb').read(), sys.argv[1], 'exec')
+except SyntaxError as e: print(f'line {e.lineno}: {e.msg}')
+except Exception: pass" "$f" 2>&1)" ;;
+    *.php|*.module|*.inc|*.install|*.theme)
+      if command -v php >/dev/null 2>&1; then
+        out="$(php -l "$f" 2>&1 | grep -v '^No syntax errors' || true)"
+      fi ;;
+    *.yml|*.yaml)
+      out="$(python3 -I -c "import sys
+try: import yaml
+except Exception: sys.exit(0)
+try: list(yaml.safe_load_all(open(sys.argv[1],encoding='utf-8')))
+except Exception as e: print(e)" "$f" 2>&1)" ;;
+  esac
+  [ -n "$out" ] && errors+="Синтаксическая ошибка в $f:"$'\n'"$out"$'\n'
+done
+
+[ -z "$errors" ] && exit 0
+# count catches for the rollout metrics (one line per caught file)
+log="${XDG_STATE_HOME:-$HOME/.local/state}/validate-edit/log.tsv"
+mkdir -p "${log%/*}" 2>/dev/null
+printf '%s' "$errors" | grep '^Синтаксическая ошибка в ' | sed "s/^Синтаксическая ошибка в //; s/:\$//; s|^|$(date -Is)\t$MODE\t|" >> "$log" 2>/dev/null
+printf '%s' "$errors" >&2
+[ "$MODE" = claude ] && exit 2
+exit 1
